@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "protocol",
+    "transport",
+    "storage",
+    "domain",
+    "routing",
+    "server",
+    "cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# None on the hot path. Protocol and transport are pure std/libc.
+# No tokio, no async-std, no messaging middleware.
+libc = "0.2"
+redb = "2"
+# Benchmarks only — proof, not production runtime dependency.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"

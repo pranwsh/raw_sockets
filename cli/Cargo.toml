@@ -1,0 +1,15 @@
+[package]
+name = "msgcli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+protocol = { path = "../protocol" }
+transport = { path = "../transport" }
+domain = { path = "../domain" }
+storage = { path = "../storage" }
+routing = { path = "../routing" }
+libc.workspace = true
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"

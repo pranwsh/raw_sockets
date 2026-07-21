@@ -1,0 +1,10 @@
+[package]
+name = "transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Non-blocking event loop, partial I/O, backpressure, teardown."
+
+[dependencies]
+protocol = { path = "../protocol" }
+libc.workspace = true

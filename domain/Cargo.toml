@@ -1,0 +1,11 @@
+[package]
+name = "domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Accounts, conversations, inboxes — independent of socket details."
+
+[dependencies]
+protocol = { path = "../protocol" }
+transport = { path = "../transport" }
+storage = { path = "../storage" }

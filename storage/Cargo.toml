@@ -1,0 +1,9 @@
+[package]
+name = "storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded persistent store (redb) with non-blocking offload."
+
+[dependencies]
+redb.workspace = true
