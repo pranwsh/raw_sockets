@@ -607,11 +607,11 @@ impl EventHandler for Domain {
         self.tick();
     }
 
-    fn drain_outbound(&mut self) -> Vec<(ConnectionId, Box<[u8]>)> {
-        std::mem::take(&mut self.outbound)
+    fn drain_outbound(&mut self, out: &mut Vec<(ConnectionId, Box<[u8]>)>) {
+        out.append(&mut self.outbound);
     }
 
-    fn drain_teardowns(&mut self) -> Vec<(ConnectionId, TeardownReason)> {
-        std::mem::take(&mut self.teardowns)
+    fn drain_teardowns(&mut self, out: &mut Vec<(ConnectionId, TeardownReason)>) {
+        out.append(&mut self.teardowns);
     }
 }

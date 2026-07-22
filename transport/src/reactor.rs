@@ -51,15 +51,11 @@ pub trait EventHandler {
     /// results) and queue outbound frames / teardowns as needed.
     fn tick(&mut self) {}
 
-    /// Drain any outgoing frames queued by the handler.
-    fn drain_outbound(&mut self) -> Vec<(ConnectionId, Box<[u8]>)> {
-        Vec::new()
-    }
+    /// Drain any outgoing frames queued by the handler into the provided buffer.
+    fn drain_outbound(&mut self, _out: &mut Vec<(ConnectionId, Box<[u8]>)>) {}
 
-    /// Drain any connection teardowns requested by the handler.
-    fn drain_teardowns(&mut self) -> Vec<(ConnectionId, TeardownReason)> {
-        Vec::new()
-    }
+    /// Drain any connection teardowns requested by the handler into the provided buffer.
+    fn drain_teardowns(&mut self, _out: &mut Vec<(ConnectionId, TeardownReason)>) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +77,16 @@ pub struct Reactor<H: EventHandler> {
     read_scratch: Vec<u8>,
     /// Reusable epoll event array.
     events: Vec<libc::epoll_event>,
+    /// Reusable buffer for outbound frames drained from the handler.
+    outbound_buf: Vec<(ConnectionId, Box<[u8]>)>,
+    /// Reusable buffer for teardown requests drained from the handler.
+    teardown_buf: Vec<(ConnectionId, TeardownReason)>,
+    /// Reusable buffer for decoded frames from a single read iteration.
+    read_frames: Vec<OwnedFrame>,
+    /// Reusable buffer for overflowed connections during backpressure.
+    overflow_buf: Vec<ConnectionId>,
+    /// Reusable buffer for connections that received writes during backpressure.
+    written_buf: Vec<ConnectionId>,
 
     /// Whether the loop should exit on the next tick.
     pub shutdown: bool,
@@ -110,6 +116,11 @@ impl<H: EventHandler> Reactor<H> {
             handler,
             read_scratch: vec![0u8; 65536],
             events: vec![libc::epoll_event { events: 0, u64: 0 }; 1024],
+            outbound_buf: Vec::new(),
+            teardown_buf: Vec::new(),
+            read_frames: Vec::with_capacity(4),
+            overflow_buf: Vec::new(),
+            written_buf: Vec::new(),
             shutdown: false,
             total_connections: 0,
         })
@@ -241,31 +252,35 @@ impl<H: EventHandler> Reactor<H> {
     }
 
     fn handle_read(&mut self, id: ConnectionId) {
-        let frames: Vec<OwnedFrame> = self.try_read_frames(id);
-        for frame in frames {
+        self.try_read_frames(id);
+        for frame in self.read_frames.drain(..) {
             self.handler.on_frame(id, frame);
         }
 
         // Drain outbound frames, tracking connections for backpressure.
-        let mut overflowed: Vec<ConnectionId> = Vec::new();
-        let mut written_targets: Vec<ConnectionId> = Vec::new();
-        for (target_id, frame) in self.handler.drain_outbound() {
+        // Swap out the buffer to avoid borrowing self while iterating.
+        self.handler.drain_outbound(&mut self.outbound_buf);
+        let mut outbound = std::mem::take(&mut self.outbound_buf);
+        self.overflow_buf.clear();
+        self.written_buf.clear();
+        for (target_id, frame) in outbound.drain(..) {
             match self.send_to(target_id, &frame) {
-                WriteOutcome::Overflow => overflowed.push(target_id),
-                WriteOutcome::Queued => written_targets.push(target_id),
+                WriteOutcome::Overflow => self.overflow_buf.push(target_id),
+                WriteOutcome::Queued => self.written_buf.push(target_id),
                 _ => {}
             }
         }
+        self.outbound_buf = outbound;
 
         // Tear down connections whose write buffer exceeded HARD_CAP.
-        for &target_id in &overflowed {
+        for &target_id in &self.overflow_buf {
             if let Some(conn) = self.connections.get_mut(&target_id) {
                 conn.start_teardown(TeardownReason::SlowClient);
             }
         }
 
         // Apply backpressure to target connections with high write buffer.
-        for &target_id in &written_targets {
+        for &target_id in &self.written_buf {
             if let Some(conn) = self.connections.get_mut(&target_id) {
                 if conn.should_pause_reading() && conn.teardown.is_none() {
                     conn.read_paused = true;
@@ -286,21 +301,25 @@ impl<H: EventHandler> Reactor<H> {
         }
 
         // Drain teardown requests from the handler.
-        for (teardown_id, reason) in self.handler.drain_teardowns() {
+        self.handler.drain_teardowns(&mut self.teardown_buf);
+        let mut teardowns = std::mem::take(&mut self.teardown_buf);
+        for (teardown_id, reason) in teardowns.drain(..) {
             if let Some(conn) = self.connections.get_mut(&teardown_id) {
                 conn.start_teardown(reason);
             }
         }
+        self.teardown_buf = teardowns;
     }
 
-    /// Read and decode any available frames. Returns empty vec on error/teardown.
-    fn try_read_frames(&mut self, id: ConnectionId) -> Vec<OwnedFrame> {
+    /// Read and decode any available frames into the reusable buffer.
+    fn try_read_frames(&mut self, id: ConnectionId) {
+        self.read_frames.clear();
         let conn = match self.connections.get_mut(&id) {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return,
         };
         if conn.read_paused {
-            return Vec::new();
+            return;
         }
         loop {
             let scratch = &mut self.read_scratch[..];
@@ -309,28 +328,29 @@ impl<H: EventHandler> Reactor<H> {
                 Ok(_) => {
                     if conn.read_buffered_bytes() > READ_BUFFER_HARD_CAP {
                         conn.start_teardown(TeardownReason::ProtocolViolation);
-                        return Vec::new();
+                        self.read_frames.clear();
+                        return;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => {
                     conn.start_teardown(TeardownReason::PeerClosed);
-                    return Vec::new();
+                    self.read_frames.clear();
+                    return;
                 }
             }
         }
-        let mut frames = Vec::with_capacity(4);
         loop {
             match conn.try_decode_frame() {
-                Ok(Some(f)) => frames.push(f),
+                Ok(Some(f)) => self.read_frames.push(f),
                 Ok(None) => break,
                 Err(_) => {
                     conn.start_teardown(TeardownReason::ProtocolViolation);
-                    return Vec::new();
+                    self.read_frames.clear();
+                    return;
                 }
             }
         }
-        frames
     }
 
     fn handle_write(&mut self, id: ConnectionId) {
@@ -445,23 +465,26 @@ impl<H: EventHandler> Reactor<H> {
 
     /// Drain outbound frames and teardowns from the handler and apply them.
     fn drain_handler_queues(&mut self) {
-        let mut overflowed: Vec<ConnectionId> = Vec::new();
-        let mut written_targets: Vec<ConnectionId> = Vec::new();
-        for (target_id, frame) in self.handler.drain_outbound() {
+        self.handler.drain_outbound(&mut self.outbound_buf);
+        let mut outbound = std::mem::take(&mut self.outbound_buf);
+        self.overflow_buf.clear();
+        self.written_buf.clear();
+        for (target_id, frame) in outbound.drain(..) {
             match self.send_to(target_id, &frame) {
-                WriteOutcome::Overflow => overflowed.push(target_id),
-                WriteOutcome::Queued => written_targets.push(target_id),
+                WriteOutcome::Overflow => self.overflow_buf.push(target_id),
+                WriteOutcome::Queued => self.written_buf.push(target_id),
                 _ => {}
             }
         }
+        self.outbound_buf = outbound;
 
-        for &target_id in &overflowed {
+        for &target_id in &self.overflow_buf {
             if let Some(conn) = self.connections.get_mut(&target_id) {
                 conn.start_teardown(TeardownReason::SlowClient);
             }
         }
 
-        for &target_id in &written_targets {
+        for &target_id in &self.written_buf {
             if let Some(conn) = self.connections.get_mut(&target_id) {
                 if conn.should_pause_reading() && conn.teardown.is_none() {
                     conn.read_paused = true;
@@ -472,11 +495,14 @@ impl<H: EventHandler> Reactor<H> {
             }
         }
 
-        for (teardown_id, reason) in self.handler.drain_teardowns() {
+        self.handler.drain_teardowns(&mut self.teardown_buf);
+        let mut teardowns = std::mem::take(&mut self.teardown_buf);
+        for (teardown_id, reason) in teardowns.drain(..) {
             if let Some(conn) = self.connections.get_mut(&teardown_id) {
                 conn.start_teardown(reason);
             }
         }
+        self.teardown_buf = teardowns;
     }
 }
 
