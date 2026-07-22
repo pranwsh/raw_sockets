@@ -253,7 +253,7 @@ impl Connection {
         }
         self.read_buf.extend_from_slice(&buf[..n]);
 
-        if self.read_offset > 4096 {
+        if self.read_offset > 32 * 1024 {
             self.read_buf.drain(..self.read_offset);
             self.read_offset = 0;
         }
