@@ -290,13 +290,19 @@ impl Domain {
     }
 
     fn deliver_to_connection(&mut self, id: ConnectionId, _user_id: &[u8], conv_id: &[u8], seq: u64, msg_data: &[u8]) {
-        let mut resp = Vec::new();
-        resp.extend_from_slice(conv_id);
-        resp.push(b'\n');
-        resp.extend_from_slice(&seq.to_le_bytes());
-        resp.extend_from_slice(msg_data);
-        let frame = protocol::encode(MsgType::Send, 0, &resp);
-        self.outbound.push((id, frame));
+        let body_len = conv_id.len() + 1 + 8 + msg_data.len();
+        let total = protocol::HEADER_LEN + body_len + protocol::TRAILER_LEN;
+        let mut buf = vec![0u8; total].into_boxed_slice();
+        let mut pos = protocol::HEADER_LEN;
+        buf[pos..pos + conv_id.len()].copy_from_slice(conv_id);
+        pos += conv_id.len();
+        buf[pos] = b'\n';
+        pos += 1;
+        buf[pos..pos + 8].copy_from_slice(&seq.to_le_bytes());
+        pos += 8;
+        buf[pos..pos + msg_data.len()].copy_from_slice(msg_data);
+        protocol::seal(&mut buf, MsgType::Send, 0, body_len);
+        self.outbound.push((id, buf));
     }
 
     fn handle_list_convs(&mut self, id: ConnectionId) {

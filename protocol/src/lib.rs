@@ -245,6 +245,22 @@ pub fn encode(msg_type: MsgType, flags: u16, body: &[u8]) -> Box<[u8]> {
     buf
 }
 
+/// Seal a buffer where the body has already been written at
+/// `buf[HEADER_LEN..HEADER_LEN+body_len]`. Writes the header and CRC in
+/// place, avoiding a redundant body copy. Returns the total wire length.
+pub fn seal(buf: &mut [u8], msg_type: MsgType, flags: u16, body_len: usize) -> usize {
+    let total = HEADER_LEN + body_len + TRAILER_LEN;
+    debug_assert!(buf.len() >= total);
+    buf[0] = MAGIC;
+    buf[1] = VERSION;
+    let tf = (msg_type as u16) & TYPE_MASK | (flags & FLAG_MASK);
+    buf[2..4].copy_from_slice(&tf.to_le_bytes());
+    buf[4..8].copy_from_slice(&(body_len as u32).to_le_bytes());
+    let crc = crc32c(&buf[1..HEADER_LEN + body_len]);
+    buf[HEADER_LEN + body_len..total].copy_from_slice(&crc.to_le_bytes());
+    total
+}
+
 // ----------------------------------------------------------------------------
 // Decoder
 // ----------------------------------------------------------------------------
