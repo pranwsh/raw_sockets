@@ -91,7 +91,7 @@ fn multiple_frames_back_to_back() {
     let mut frames = 0;
     loop {
         match decode(&buf[offset..]) {
-            Decode::Complete { frame, consumed } => {
+            Decode::Complete { frame: _, consumed } => {
                 frames += 1;
                 offset += consumed;
                 if offset == buf.len() {
