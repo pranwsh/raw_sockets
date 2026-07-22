@@ -130,6 +130,83 @@ fn ping_round_trip(addr: SocketAddr) -> Duration {
     }
 }
 
+fn send_round_trip(addr: SocketAddr) -> Duration {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let user_id = b"send_bench";
+
+    // Authenticate.
+    let hello = protocol::encode(MsgType::Hello, 0, user_id);
+    stream.write_all(&hello).unwrap();
+    let mut buf = vec![0u8; 8192];
+    let mut offset = 0;
+    loop {
+        match protocol::decode(&buf[..offset]) {
+            Decode::Complete { consumed, .. } => {
+                offset -= consumed;
+                buf.copy_within(consumed.., 0);
+                break;
+            }
+            Decode::Need => {
+                let n = stream.read(&mut buf[offset..]).unwrap();
+                offset += n;
+            }
+            Decode::Err(_) => panic!("decode error"),
+        }
+    }
+
+    // Create a conversation with a second user so the send path is exercised
+    // (conversation lookup, sequence allocation, delivery).
+    let conv_body = b"send_bench,recv_bench";
+    stream.write_all(&protocol::encode(MsgType::CreateConv, 0, conv_body)).unwrap();
+    let conv_id;
+    loop {
+        match protocol::decode(&buf[..offset]) {
+            Decode::Complete { frame, consumed } => {
+                if frame.msg_type == MsgType::ConvCreated {
+                    conv_id = frame.body.to_vec();
+                    offset -= consumed;
+                    buf.copy_within(consumed.., 0);
+                    break;
+                }
+                offset -= consumed;
+                buf.copy_within(consumed.., 0);
+            }
+            Decode::Need => {
+                let n = stream.read(&mut buf[offset..]).unwrap();
+                offset += n;
+            }
+            Decode::Err(_) => panic!("decode error"),
+        }
+    }
+
+    // Measure Send → Delivered round-trip.
+    let mut msg = Vec::new();
+    msg.extend_from_slice(&conv_id);
+    msg.push(b'\n');
+    msg.extend_from_slice(b"benchmark payload");
+    let send_frame = protocol::encode(MsgType::Send, 0, &msg);
+    let start = Instant::now();
+    stream.write_all(&send_frame).unwrap();
+
+    loop {
+        match protocol::decode(&buf[..offset]) {
+            Decode::Complete { frame, consumed } => {
+                if frame.msg_type == MsgType::Delivered {
+                    return start.elapsed();
+                }
+                offset -= consumed;
+                buf.copy_within(consumed.., 0);
+            }
+            Decode::Need => {
+                let n = stream.read(&mut buf[offset..]).unwrap();
+                offset += n;
+            }
+            Decode::Err(_) => panic!("decode error"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Criterion benches
 // ---------------------------------------------------------------------------
@@ -159,5 +236,17 @@ fn bench_ping_throughput(c: &mut Criterion) {
     drop(server);
 }
 
-criterion_group!(benches, bench_auth_latency, bench_ping_throughput);
+fn bench_send_throughput(c: &mut Criterion) {
+    let server = spawn_server();
+
+    c.bench_function("send_round_trip", |b| {
+        b.iter(|| {
+            black_box(send_round_trip(server.addr));
+        })
+    });
+
+    drop(server);
+}
+
+criterion_group!(benches, bench_auth_latency, bench_ping_throughput, bench_send_throughput);
 criterion_main!(benches);
