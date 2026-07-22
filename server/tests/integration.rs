@@ -19,9 +19,31 @@ use protocol::{self, MsgType, OwnedFrame, Decode};
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Spawn a `msgd` instance on a random port. Returns the process handle and
-/// the bound address.
-fn spawn_server() -> (Child, SocketAddr) {
+/// Wraps a child process and kills it on drop.
+struct ServerGuard {
+    child: Option<Child>,
+}
+
+impl ServerGuard {
+    fn new(child: Child) -> Self {
+        // Give the server time to start.
+        thread::sleep(Duration::from_millis(200));
+        Self { child: Some(child) }
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Spawn a `msgd` instance on a random port. Returns a guard that kills the
+/// server on drop, and the bound address.
+fn spawn_server() -> (ServerGuard, SocketAddr) {
     let port = portpicker();
     let data_path = format!("/tmp/msgd_test_{}", port);
     let bind = format!("127.0.0.1:{}", port);
@@ -34,11 +56,8 @@ fn spawn_server() -> (Child, SocketAddr) {
         .spawn()
         .expect("failed to spawn msgd");
 
-    // Give the server time to start.
-    thread::sleep(Duration::from_millis(200));
-
     let addr: SocketAddr = bind.parse().unwrap();
-    (child, addr)
+    (ServerGuard::new(child), addr)
 }
 
 fn portpicker() -> u16 {

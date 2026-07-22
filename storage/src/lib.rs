@@ -8,6 +8,11 @@
 //! The background thread is a simple poll loop over an incoming channel.
 //! It processes one operation at a time — redb is single-writer already, so
 //! serializing at this level adds no contention that wouldn't exist anyway.
+//!
+//! **Async API**: Every operation has an `_async` variant that returns an
+//! `mpsc::Receiver<StoreResult>` immediately. The caller polls with
+//! `try_recv()` on its own tick, avoiding any blocking on the event-loop
+//! thread. The blocking variants remain for convenience in tests and the CLI.
 
 #![forbid(unsafe_code)]
 
@@ -27,18 +32,32 @@ static TABLE_MESSAGE_LOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("
 static TABLE_SEQUENCE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sequence_v1");
 
 // ---------------------------------------------------------------------------
+// StoreResult — type-erased response so every async method returns the same
+// Receiver<T>.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum StoreResult {
+    Account(Result<Option<Vec<u8>>, StoreError>),
+    Conversation(Result<Option<Vec<u8>>, StoreError>),
+    Sequence(Result<u64, StoreError>),
+    InboxRange(Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError>),
+    Stored(Result<(), StoreError>),
+}
+
+// ---------------------------------------------------------------------------
 // Op enum
 // ---------------------------------------------------------------------------
 
 enum Op {
-    PutAccount { user_id: Vec<u8>, data: Vec<u8>, tx: Sender<Result<(), StoreError>> },
-    GetAccount { user_id: Vec<u8>, tx: Sender<Result<Option<Vec<u8>>, StoreError>> },
-    PutConversation { conv_id: Vec<u8>, data: Vec<u8>, tx: Sender<Result<(), StoreError>> },
-    GetConversation { conv_id: Vec<u8>, tx: Sender<Result<Option<Vec<u8>>, StoreError>> },
-    NextSequence { conv_id: Vec<u8>, tx: Sender<Result<u64, StoreError>> },
-    PutInbox { key: Vec<u8>, data: Vec<u8>, tx: Sender<Result<(), StoreError>> },
-    GetInboxRange { prefix: Vec<u8>, limit: u32, tx: Sender<Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError>> },
-    DeleteInbox { key: Vec<u8>, tx: Sender<Result<(), StoreError>> },
+    PutAccount { user_id: Vec<u8>, data: Vec<u8>, tx: Sender<StoreResult> },
+    GetAccount { user_id: Vec<u8>, tx: Sender<StoreResult> },
+    PutConversation { conv_id: Vec<u8>, data: Vec<u8>, tx: Sender<StoreResult> },
+    GetConversation { conv_id: Vec<u8>, tx: Sender<StoreResult> },
+    NextSequence { conv_id: Vec<u8>, tx: Sender<StoreResult> },
+    PutInbox { key: Vec<u8>, data: Vec<u8>, tx: Sender<StoreResult> },
+    GetInboxRange { prefix: Vec<u8>, limit: u32, tx: Sender<StoreResult> },
+    DeleteInbox { key: Vec<u8>, tx: Sender<StoreResult> },
     Shutdown,
 }
 
@@ -86,60 +105,128 @@ impl Store {
         self.tx.send(op).map_err(|_| StoreError::Channel)
     }
 
-    // ---- Account ----
+    // -------------------------------------------------------------------
+    // Async API — returns immediately, caller polls with try_recv()
+    // -------------------------------------------------------------------
 
-    pub fn put_account(&self, user_id: &[u8], data: &[u8]) -> Result<(), StoreError> {
+    pub fn put_account_async(&self, user_id: &[u8], data: &[u8]) -> Result<Receiver<StoreResult>, StoreError> {
         let (tx, rx) = mpsc::channel();
         self.send(Op::PutAccount { user_id: user_id.to_vec(), data: data.to_vec(), tx })?;
-        rx.recv().map_err(|_| StoreError::Channel)?
+        Ok(rx)
+    }
+
+    pub fn get_account_async(&self, user_id: &[u8]) -> Result<Receiver<StoreResult>, StoreError> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Op::GetAccount { user_id: user_id.to_vec(), tx })?;
+        Ok(rx)
+    }
+
+    pub fn put_conversation_async(&self, conv_id: &[u8], data: &[u8]) -> Result<Receiver<StoreResult>, StoreError> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Op::PutConversation { conv_id: conv_id.to_vec(), data: data.to_vec(), tx })?;
+        Ok(rx)
+    }
+
+    pub fn get_conversation_async(&self, conv_id: &[u8]) -> Result<Receiver<StoreResult>, StoreError> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Op::GetConversation { conv_id: conv_id.to_vec(), tx })?;
+        Ok(rx)
+    }
+
+    pub fn next_sequence_async(&self, conv_id: &[u8]) -> Result<Receiver<StoreResult>, StoreError> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Op::NextSequence { conv_id: conv_id.to_vec(), tx })?;
+        Ok(rx)
+    }
+
+    pub fn put_inbox_async(&self, key: &[u8], data: &[u8]) -> Result<Receiver<StoreResult>, StoreError> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Op::PutInbox { key: key.to_vec(), data: data.to_vec(), tx })?;
+        Ok(rx)
+    }
+
+    pub fn get_inbox_range_async(&self, prefix: &[u8], limit: u32) -> Result<Receiver<StoreResult>, StoreError> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Op::GetInboxRange { prefix: prefix.to_vec(), limit, tx })?;
+        Ok(rx)
+    }
+
+    pub fn delete_inbox_async(&self, key: &[u8]) -> Result<Receiver<StoreResult>, StoreError> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Op::DeleteInbox { key: key.to_vec(), tx })?;
+        Ok(rx)
+    }
+
+    // -------------------------------------------------------------------
+    // Blocking API — convenience for tests and CLI
+    // -------------------------------------------------------------------
+
+    fn recv_blocking(rx: Receiver<StoreResult>) -> Result<StoreResult, StoreError> {
+        rx.recv().map_err(|_| StoreError::Channel)
+    }
+
+    pub fn put_account(&self, user_id: &[u8], data: &[u8]) -> Result<(), StoreError> {
+        let rx = self.put_account_async(user_id, data)?;
+        match Self::recv_blocking(rx)? {
+            StoreResult::Stored(r) => r,
+            _ => unreachable!(),
+        }
     }
 
     pub fn get_account(&self, user_id: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let (tx, rx) = mpsc::channel();
-        self.send(Op::GetAccount { user_id: user_id.to_vec(), tx })?;
-        rx.recv().map_err(|_| StoreError::Channel)?
+        let rx = self.get_account_async(user_id)?;
+        match Self::recv_blocking(rx)? {
+            StoreResult::Account(r) => r,
+            _ => unreachable!(),
+        }
     }
 
-    // ---- Conversation ----
-
     pub fn put_conversation(&self, conv_id: &[u8], data: &[u8]) -> Result<(), StoreError> {
-        let (tx, rx) = mpsc::channel();
-        self.send(Op::PutConversation { conv_id: conv_id.to_vec(), data: data.to_vec(), tx })?;
-        rx.recv().map_err(|_| StoreError::Channel)?
+        let rx = self.put_conversation_async(conv_id, data)?;
+        match Self::recv_blocking(rx)? {
+            StoreResult::Stored(r) => r,
+            _ => unreachable!(),
+        }
     }
 
     pub fn get_conversation(&self, conv_id: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let (tx, rx) = mpsc::channel();
-        self.send(Op::GetConversation { conv_id: conv_id.to_vec(), tx })?;
-        rx.recv().map_err(|_| StoreError::Channel)?
+        let rx = self.get_conversation_async(conv_id)?;
+        match Self::recv_blocking(rx)? {
+            StoreResult::Conversation(r) => r,
+            _ => unreachable!(),
+        }
     }
-
-    // ---- Sequence ----
 
     pub fn next_sequence(&self, conv_id: &[u8]) -> Result<u64, StoreError> {
-        let (tx, rx) = mpsc::channel();
-        self.send(Op::NextSequence { conv_id: conv_id.to_vec(), tx })?;
-        rx.recv().map_err(|_| StoreError::Channel)?
+        let rx = self.next_sequence_async(conv_id)?;
+        match Self::recv_blocking(rx)? {
+            StoreResult::Sequence(r) => r,
+            _ => unreachable!(),
+        }
     }
 
-    // ---- Inbox ----
-
     pub fn put_inbox(&self, key: &[u8], data: &[u8]) -> Result<(), StoreError> {
-        let (tx, rx) = mpsc::channel();
-        self.send(Op::PutInbox { key: key.to_vec(), data: data.to_vec(), tx })?;
-        rx.recv().map_err(|_| StoreError::Channel)?
+        let rx = self.put_inbox_async(key, data)?;
+        match Self::recv_blocking(rx)? {
+            StoreResult::Stored(r) => r,
+            _ => unreachable!(),
+        }
     }
 
     pub fn get_inbox_range(&self, prefix: &[u8], limit: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
-        let (tx, rx) = mpsc::channel();
-        self.send(Op::GetInboxRange { prefix: prefix.to_vec(), limit, tx })?;
-        rx.recv().map_err(|_| StoreError::Channel)?
+        let rx = self.get_inbox_range_async(prefix, limit)?;
+        match Self::recv_blocking(rx)? {
+            StoreResult::InboxRange(r) => r,
+            _ => unreachable!(),
+        }
     }
 
     pub fn delete_inbox(&self, key: &[u8]) -> Result<(), StoreError> {
-        let (tx, rx) = mpsc::channel();
-        self.send(Op::DeleteInbox { key: key.to_vec(), tx })?;
-        rx.recv().map_err(|_| StoreError::Channel)?
+        let rx = self.delete_inbox_async(key)?;
+        match Self::recv_blocking(rx)? {
+            StoreResult::Stored(r) => r,
+            _ => unreachable!(),
+        }
     }
 
     pub fn shutdown(&self) {
@@ -202,7 +289,7 @@ fn process_op(db: &Database, op: Op) -> bool {
                 txn.commit().map_err(db_err)?;
                 Ok(())
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(StoreResult::Stored(result));
         }
 
         Op::GetAccount { user_id, tx } => {
@@ -212,7 +299,7 @@ fn process_op(db: &Database, op: Op) -> bool {
                 let value = table.get(user_id.as_slice()).map_err(db_err)?;
                 Ok(value.map(|v| v.value().to_vec()))
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(StoreResult::Account(result));
         }
 
         Op::PutConversation { conv_id, data, tx } => {
@@ -225,7 +312,7 @@ fn process_op(db: &Database, op: Op) -> bool {
                 txn.commit().map_err(db_err)?;
                 Ok(())
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(StoreResult::Stored(result));
         }
 
         Op::GetConversation { conv_id, tx } => {
@@ -235,7 +322,7 @@ fn process_op(db: &Database, op: Op) -> bool {
                 let value = table.get(conv_id.as_slice()).map_err(db_err)?;
                 Ok(value.map(|v| v.value().to_vec()))
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(StoreResult::Conversation(result));
         }
 
         Op::NextSequence { conv_id, tx } => {
@@ -263,7 +350,7 @@ fn process_op(db: &Database, op: Op) -> bool {
                 txn.commit().map_err(db_err)?;
                 Ok(next)
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(StoreResult::Sequence(result));
         }
 
         Op::PutInbox { key, data, tx } => {
@@ -276,7 +363,7 @@ fn process_op(db: &Database, op: Op) -> bool {
                 txn.commit().map_err(db_err)?;
                 Ok(())
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(StoreResult::Stored(result));
         }
 
         Op::GetInboxRange { prefix, limit, tx } => {
@@ -291,7 +378,7 @@ fn process_op(db: &Database, op: Op) -> bool {
                     .collect();
                 Ok(items)
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(StoreResult::InboxRange(result));
         }
 
         Op::DeleteInbox { key, tx } => {
@@ -304,7 +391,7 @@ fn process_op(db: &Database, op: Op) -> bool {
                 txn.commit().map_err(db_err)?;
                 Ok(())
             })();
-            let _ = tx.send(result);
+            let _ = tx.send(StoreResult::Stored(result));
         }
     }
     true

@@ -145,18 +145,22 @@ fn send_msg(
                 }
             }
             MsgType::Send => {
-                let parts: Vec<&[u8]> = frame.body.splitn(4, |&b| b == b'\n').collect();
-                if parts.len() >= 4 {
-                    let conv_hex = hex::encode(parts[0]);
-                    let seq = u64::from_le_bytes(parts[1][..8].try_into().unwrap());
-                    let sender = String::from_utf8_lossy(parts[2]);
-                    let msg = String::from_utf8_lossy(parts[3]);
-                    eprintln!("echo: conv={} seq={} from={} msg={}", conv_hex, seq, sender, msg);
-                } else if parts.len() >= 3 {
-                    let conv_hex = hex::encode(parts[0]);
-                    let seq = u64::from_le_bytes(parts[1][..8].try_into().unwrap());
-                    let rest = String::from_utf8_lossy(parts[2]);
-                    eprintln!("echo: conv={} seq={} rest={}", conv_hex, seq, rest);
+                if let Some(sep) = frame.body.iter().position(|&b| b == b'\n') {
+                    let conv_hex = hex::encode(&frame.body[..sep]);
+                    let after = &frame.body[sep + 1..];
+                    if after.len() >= 8 {
+                        let seq = u64::from_le_bytes(after[..8].try_into().unwrap());
+                        let msg_bytes = &after[8..];
+                        let from_sep = msg_bytes.iter().position(|&b| b == b'\n');
+                        let (sender, msg) = match from_sep {
+                            Some(p) => (
+                                String::from_utf8_lossy(&msg_bytes[..p]),
+                                String::from_utf8_lossy(&msg_bytes[p + 1..]),
+                            ),
+                            None => (String::from_utf8_lossy(msg_bytes), "".into()),
+                        };
+                        eprintln!("echo: conv={} seq={} from={} msg={}", conv_hex, seq, sender, msg);
+                    }
                 }
             }
             _ => {

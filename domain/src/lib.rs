@@ -4,16 +4,23 @@
 //! produces encoded frames to send back. It reads/writes through the
 //! [`storage::Store`] handle (which offloads to a background thread).
 //!
+//! All storage operations are **non-blocking**: `on_frame` queues async store
+//! calls and returns immediately. The reactor calls [`EventHandler::tick`]
+//! each iteration, which polls pending storage results and dispatches the
+//! next step of each operation. This keeps the event loop free to service
+//! other clients while a DB read/write is in flight.
+//!
 //! The [`Domain`] struct implements [`transport::EventHandler`] and is the
 //! centerpiece the server binary wires into each shard's reactor.
 
 #![forbid(unsafe_code)]
 
 use protocol::{self, MsgType, OwnedFrame};
-use storage::Store;
+use storage::{Store, StoreResult};
 use transport::{ConnectionId, EventHandler, TeardownReason};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddrV4;
+use std::sync::mpsc;
 
 pub const TOKEN_LEN: usize = 32;
 const SERVER_SECRET: &[u8] = b"change-me-in-production";
@@ -40,6 +47,30 @@ fn inbox_prefix_user(user_id: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Pending async storage operations
+// ---------------------------------------------------------------------------
+
+/// What kind of storage operation is in flight, plus the context needed to
+/// process the result on the next tick.
+enum PendingKind {
+    HelloLookup { user_id: Vec<u8> },
+    AuthLookup { user_id: Vec<u8>, token: Vec<u8> },
+    AccountCreate { user_id: Vec<u8>, token: [u8; TOKEN_LEN] },
+    SendConvLookup { session: Session, conv_id: Vec<u8>, msg_body: Vec<u8> },
+    SendSeqNext { session: Session, conv_id: Vec<u8>, msg_body: Vec<u8>, members: Vec<Vec<u8>> },
+    CreateConvStore { conv_id: Vec<u8>, members_raw: Vec<u8> },
+    ConvInviteLookup { conv_id: Vec<u8>, invitee: Vec<u8> },
+    ConvInviteStore { conv_id: Vec<u8>, invitee: Vec<u8>, updated_members: Vec<u8> },
+    InboxFetch { user_id: Vec<u8>, prefix: Vec<u8>, send_resp: bool },
+}
+
+struct PendingOp {
+    conn_id: ConnectionId,
+    kind: PendingKind,
+    rx: mpsc::Receiver<StoreResult>,
+}
+
+// ---------------------------------------------------------------------------
 // Domain
 // ---------------------------------------------------------------------------
 
@@ -47,10 +78,13 @@ pub struct Domain {
     store: Store,
     sessions: HashMap<ConnectionId, Session>,
     user_connections: HashMap<Vec<u8>, Vec<ConnectionId>>,
+    user_conversations: HashMap<Vec<u8>, HashSet<Vec<u8>>>,
     /// Frames queued for the reactor to send.
     pub outbound: Vec<(ConnectionId, Box<[u8]>)>,
     /// Teardown requests queued for the reactor.
     pub teardowns: Vec<(ConnectionId, TeardownReason)>,
+    /// In-flight async storage operations.
+    pending_ops: Vec<PendingOp>,
 }
 
 impl Domain {
@@ -59,8 +93,10 @@ impl Domain {
             store,
             sessions: HashMap::new(),
             user_connections: HashMap::new(),
+            user_conversations: HashMap::new(),
             outbound: Vec::new(),
             teardowns: Vec::new(),
+            pending_ops: Vec::new(),
         }
     }
 
@@ -90,29 +126,23 @@ impl Domain {
         token
     }
 
-    fn handle_hello(&mut self, id: ConnectionId, user_id: &[u8]) {
-        if user_id.is_empty() || user_id.len() > 256 {
+    fn handle_hello(&mut self, id: ConnectionId, body: &[u8]) {
+        if body.is_empty() || body.len() > 256 {
             self.enqueue(id, MsgType::AuthFail, b"invalid_user_id");
             return;
         }
-        match self.store.get_account(user_id) {
-            Ok(Some(_)) => {
-                let challenge_body = [b"token_required\n".as_slice(), user_id].concat();
-                self.enqueue(id, MsgType::AuthChallenge, &challenge_body);
-            }
-            Ok(None) => {
-                let token = Self::derive_token(user_id);
-                if let Err(e) = self.store.put_account(user_id, &token) {
-                    self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
-                    return;
-                }
-                self.enqueue(id, MsgType::AuthOk, &token);
-                self.establish_session(id, user_id.to_vec());
-            }
+        let rx = match self.store.get_account_async(body) {
+            Ok(rx) => rx,
             Err(e) => {
                 self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
+                return;
             }
-        }
+        };
+        self.pending_ops.push(PendingOp {
+            conn_id: id,
+            kind: PendingKind::HelloLookup { user_id: body.to_vec() },
+            rx,
+        });
     }
 
     fn handle_auth_response(&mut self, id: ConnectionId, body: &[u8]) {
@@ -126,19 +156,36 @@ impl Domain {
             self.enqueue(id, MsgType::AuthFail, b"bad_auth_format");
             return;
         }
-        let expected = Self::derive_token(user_id);
-        if token == &expected[..] {
-            self.enqueue(id, MsgType::AuthOk, token);
-            self.establish_session(id, user_id.to_vec());
-        } else {
-            self.enqueue(id, MsgType::AuthFail, b"invalid_token");
-        }
+        let rx = match self.store.get_account_async(user_id) {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
+                return;
+            }
+        };
+        self.pending_ops.push(PendingOp {
+            conn_id: id,
+            kind: PendingKind::AuthLookup { user_id: user_id.to_vec(), token: token.to_vec() },
+            rx,
+        });
     }
 
     fn establish_session(&mut self, id: ConnectionId, user_id: Vec<u8>) {
         self.sessions.insert(id, Session { user_id: user_id.clone(), authenticated: true });
         self.user_connections.entry(user_id.clone()).or_default().push(id);
-        self.deliver_inbox(id, &user_id);
+        let prefix = inbox_prefix_user(&user_id);
+        let rx = match self.store.get_inbox_range_async(&prefix, 100) {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.enqueue(id, MsgType::Error, format!("inbox: {e}").as_bytes());
+                return;
+            }
+        };
+        self.pending_ops.push(PendingOp {
+            conn_id: id,
+            kind: PendingKind::InboxFetch { user_id, prefix, send_resp: false },
+            rx,
+        });
     }
 
     fn authenticated(&self, id: ConnectionId) -> Option<&Session> {
@@ -171,11 +218,18 @@ impl Domain {
             }
             h.to_le_bytes().to_vec()
         };
-        if let Err(e) = self.store.put_conversation(&conv_id, body) {
-            self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
-            return;
-        }
-        self.enqueue(id, MsgType::ConvCreated, &conv_id);
+        let rx = match self.store.put_conversation_async(&conv_id, body) {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
+                return;
+            }
+        };
+        self.pending_ops.push(PendingOp {
+            conn_id: id,
+            kind: PendingKind::CreateConvStore { conv_id, members_raw: body.to_vec() },
+            rx,
+        });
     }
 
     fn handle_conv_invite(&mut self, id: ConnectionId, body: &[u8]) {
@@ -185,18 +239,21 @@ impl Domain {
         let sep = body.iter().position(|&b| b == b'\n').unwrap_or(body.len());
         let conv_id = &body[..sep];
         let invitee = if sep < body.len() { &body[sep + 1..] } else { return };
-        let data = match self.store.get_conversation(conv_id) {
-            Ok(Some(d)) => d,
-            _ => { self.enqueue(id, MsgType::Error, b"conv_not_found"); return; }
-        };
-        let mut members = data;
-        members.extend_from_slice(b",");
-        members.extend_from_slice(invitee);
-        if let Err(e) = self.store.put_conversation(conv_id, &members) {
-            self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
+        if invitee.is_empty() {
             return;
         }
-        self.enqueue(id, MsgType::ConvMemberEvent, &members);
+        let rx = match self.store.get_conversation_async(conv_id) {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
+                return;
+            }
+        };
+        self.pending_ops.push(PendingOp {
+            conn_id: id,
+            kind: PendingKind::ConvInviteLookup { conv_id: conv_id.to_vec(), invitee: invitee.to_vec() },
+            rx,
+        });
     }
 
     // -------------------------------------------------------------------
@@ -212,29 +269,24 @@ impl Domain {
             self.enqueue(id, MsgType::Error, b"bad_send_format");
             return;
         };
-        let conv_id = &body[..sep];
-        let msg_body = &body[sep + 1..];
+        let conv_id = body[..sep].to_vec();
+        let msg_body = body[sep + 1..].to_vec();
         if msg_body.is_empty() {
             self.enqueue(id, MsgType::Error, b"empty_message");
             return;
         }
-        let seq = match self.store.next_sequence(conv_id) {
-            Ok(s) => s,
-            Err(e) => { self.enqueue(id, MsgType::Error, format!("seq: {e}").as_bytes()); return; }
+        let rx = match self.store.get_conversation_async(&conv_id) {
+            Ok(rx) => rx,
+            Err(e) => {
+                self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
+                return;
+            }
         };
-        let msg_data = {
-            let mut d = Vec::new();
-            d.extend_from_slice(&session.user_id);
-            d.push(b'\n');
-            d.extend_from_slice(msg_body);
-            d
-        };
-        if let Err(e) = self.store.put_inbox(&seq.to_le_bytes(), &msg_data) {
-            self.enqueue(id, MsgType::Error, format!("store: {e}").as_bytes());
-            return;
-        }
-        self.deliver_to_connection(id, &session.user_id, conv_id, seq, &msg_data);
-        self.enqueue(id, MsgType::Delivered, &seq.to_le_bytes());
+        self.pending_ops.push(PendingOp {
+            conn_id: id,
+            kind: PendingKind::SendConvLookup { session, conv_id, msg_body },
+            rx,
+        });
     }
 
     fn deliver_to_connection(&mut self, id: ConnectionId, _user_id: &[u8], conv_id: &[u8], seq: u64, msg_data: &[u8]) {
@@ -242,43 +294,42 @@ impl Domain {
         resp.extend_from_slice(conv_id);
         resp.push(b'\n');
         resp.extend_from_slice(&seq.to_le_bytes());
-        resp.push(b'\n');
         resp.extend_from_slice(msg_data);
         let frame = protocol::encode(MsgType::Send, 0, &resp);
         self.outbound.push((id, frame));
     }
 
-    fn deliver_inbox(&mut self, id: ConnectionId, user_id: &[u8]) {
-        let prefix = inbox_prefix_user(user_id);
-        let items = match self.store.get_inbox_range(&prefix, 100) {
-            Ok(items) => items,
+    fn handle_list_convs(&mut self, id: ConnectionId) {
+        let session = match self.authenticated(id) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let conv_ids = self.user_conversations.get(&session.user_id).cloned().unwrap_or_default();
+        let mut body = Vec::new();
+        for conv_id in &conv_ids {
+            body.extend_from_slice(conv_id);
+        }
+        self.enqueue(id, MsgType::ConvsResp, &body);
+    }
+
+    fn handle_inbox_fetch(&mut self, id: ConnectionId) {
+        let session = match self.authenticated(id) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let prefix = inbox_prefix_user(&session.user_id);
+        let rx = match self.store.get_inbox_range_async(&prefix, 100) {
+            Ok(rx) => rx,
             Err(e) => {
                 self.enqueue(id, MsgType::Error, format!("inbox: {e}").as_bytes());
                 return;
             }
         };
-        for (key, data) in &items {
-            if key.starts_with(&prefix) && key.len() > prefix.len() {
-                let rest = &key[prefix.len()..];
-                let parts: Vec<&[u8]> = rest.split(|&b| b == b'/').collect();
-                if parts.len() >= 2 {
-                    let conv_id = parts[0];
-                    let seq = if parts[1].len() >= 8 {
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(&parts[1][..8]);
-                        u64::from_be_bytes(arr)
-                    } else {
-                        continue;
-                    };
-                    self.deliver_to_connection(id, user_id, conv_id, seq, data);
-                    let _ = self.store.delete_inbox(&key);
-                }
-            }
-        }
-    }
-
-    fn handle_inbox_fetch(&mut self, id: ConnectionId, _body: &[u8]) {
-        self.enqueue(id, MsgType::InboxResp, &[]);
+        self.pending_ops.push(PendingOp {
+            conn_id: id,
+            kind: PendingKind::InboxFetch { user_id: session.user_id, prefix, send_resp: true },
+            rx,
+        });
     }
 
     fn handle_goodbye(&mut self, id: ConnectionId) {
@@ -291,6 +342,228 @@ impl Domain {
             }
         }
         self.teardowns.push((id, TeardownReason::ClientGoodbye));
+    }
+
+    // -------------------------------------------------------------------
+    // Async result processing
+    // -------------------------------------------------------------------
+
+    fn tick(&mut self) {
+        let mut i = 0;
+        while i < self.pending_ops.len() {
+            match self.pending_ops[i].rx.try_recv() {
+                Ok(result) => {
+                    let op = self.pending_ops.swap_remove(i);
+                    self.process_pending_result(op.conn_id, op.kind, result);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    i += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_ops.swap_remove(i);
+                }
+            }
+        }
+    }
+
+    fn process_pending_result(&mut self, conn_id: ConnectionId, kind: PendingKind, result: StoreResult) {
+        match (kind, result) {
+            // ---- Hello flow ----
+            (PendingKind::HelloLookup { user_id }, StoreResult::Account(Ok(Some(_)))) => {
+                let challenge_body = [b"token_required\n".as_slice(), &user_id].concat();
+                self.enqueue(conn_id, MsgType::AuthChallenge, &challenge_body);
+            }
+            (PendingKind::HelloLookup { user_id }, StoreResult::Account(Ok(None))) => {
+                let token = Self::derive_token(&user_id);
+                let rx = match self.store.put_account_async(&user_id, &token) {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+                        return;
+                    }
+                };
+                self.pending_ops.push(PendingOp {
+                    conn_id,
+                    kind: PendingKind::AccountCreate { user_id, token },
+                    rx,
+                });
+            }
+            (PendingKind::HelloLookup { .. }, StoreResult::Account(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+            }
+
+            // ---- Account create (after Hello for new user) ----
+            (PendingKind::AccountCreate { user_id, token }, StoreResult::Stored(Ok(()))) => {
+                self.enqueue(conn_id, MsgType::AuthOk, &token);
+                self.establish_session(conn_id, user_id);
+            }
+            (PendingKind::AccountCreate { .. }, StoreResult::Stored(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+            }
+
+            // ---- Auth response flow ----
+            (PendingKind::AuthLookup { user_id, token }, StoreResult::Account(Ok(Some(_)))) => {
+                let expected = Self::derive_token(&user_id);
+                if token.len() == TOKEN_LEN && &token[..] == &expected[..] {
+                    self.enqueue(conn_id, MsgType::AuthOk, &token);
+                    self.establish_session(conn_id, user_id);
+                } else {
+                    self.enqueue(conn_id, MsgType::AuthFail, b"invalid_token");
+                }
+            }
+            (PendingKind::AuthLookup { .. }, StoreResult::Account(Ok(None))) => {
+                self.enqueue(conn_id, MsgType::AuthFail, b"account_not_found");
+            }
+            (PendingKind::AuthLookup { .. }, StoreResult::Account(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+            }
+
+            // ---- Send: conversation lookup ----
+            (PendingKind::SendConvLookup { session, conv_id, msg_body }, StoreResult::Conversation(Ok(Some(data)))) => {
+                let members: Vec<Vec<u8>> = data.split(|&b| b == b',').map(|m| m.to_vec()).collect();
+                if !members.iter().any(|m| m == &session.user_id) {
+                    self.enqueue(conn_id, MsgType::Error, b"not_a_member");
+                    return;
+                }
+                let rx = match self.store.next_sequence_async(&conv_id) {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        self.enqueue(conn_id, MsgType::Error, format!("seq: {e}").as_bytes());
+                        return;
+                    }
+                };
+                self.pending_ops.push(PendingOp {
+                    conn_id,
+                    kind: PendingKind::SendSeqNext { session, conv_id, msg_body, members },
+                    rx,
+                });
+            }
+            (PendingKind::SendConvLookup { .. }, StoreResult::Conversation(Ok(None))) => {
+                self.enqueue(conn_id, MsgType::Error, b"conv_not_found");
+            }
+            (PendingKind::SendConvLookup { .. }, StoreResult::Conversation(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+            }
+
+            // ---- Send: sequence obtained → deliver + ack ----
+            (PendingKind::SendSeqNext { session, conv_id, msg_body, members }, StoreResult::Sequence(Ok(seq))) => {
+                let msg_data = {
+                    let mut d = Vec::new();
+                    d.extend_from_slice(&session.user_id);
+                    d.push(b'\n');
+                    d.extend_from_slice(&msg_body);
+                    d
+                };
+                for member in &members {
+                    if member != &session.user_id {
+                        if let Some(conns) = self.user_connections.get(member) {
+                            let targets: Vec<ConnectionId> = conns.clone();
+                            for target_id in targets {
+                                self.deliver_to_connection(target_id, &session.user_id, &conv_id, seq, &msg_data);
+                            }
+                        }
+                    }
+                }
+                for member in &members {
+                    if !self.user_connections.contains_key(member) && member != &session.user_id {
+                        let mut inbox_key = Vec::new();
+                        inbox_key.extend_from_slice(member);
+                        inbox_key.push(b'/');
+                        inbox_key.extend_from_slice(&conv_id);
+                        inbox_key.push(b'/');
+                        inbox_key.extend_from_slice(&seq.to_be_bytes());
+                        let _ = self.store.put_inbox_async(&inbox_key, &msg_data);
+                    }
+                }
+                self.enqueue(conn_id, MsgType::Delivered, &seq.to_le_bytes());
+            }
+            (PendingKind::SendSeqNext { .. }, StoreResult::Sequence(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("seq: {e}").as_bytes());
+            }
+
+            // ---- CreateConv store complete ----
+            (PendingKind::CreateConvStore { conv_id, members_raw }, StoreResult::Stored(Ok(()))) => {
+                self.enqueue(conn_id, MsgType::ConvCreated, &conv_id);
+                for member in members_raw.split(|&b| b == b',') {
+                    if !member.is_empty() {
+                        self.user_conversations.entry(member.to_vec()).or_default().insert(conv_id.clone());
+                    }
+                }
+            }
+            (PendingKind::CreateConvStore { .. }, StoreResult::Stored(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+            }
+
+            // ---- ConvInvite: conversation lookup ----
+            (PendingKind::ConvInviteLookup { conv_id, invitee }, StoreResult::Conversation(Ok(Some(data)))) => {
+                let mut members = data;
+                members.extend_from_slice(b",");
+                members.extend_from_slice(&invitee);
+                let rx = match self.store.put_conversation_async(&conv_id, &members) {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+                        return;
+                    }
+                };
+                self.pending_ops.push(PendingOp {
+                    conn_id,
+                    kind: PendingKind::ConvInviteStore { conv_id, invitee, updated_members: members },
+                    rx,
+                });
+            }
+            (PendingKind::ConvInviteLookup { .. }, StoreResult::Conversation(Ok(None))) => {
+                self.enqueue(conn_id, MsgType::Error, b"conv_not_found");
+            }
+            (PendingKind::ConvInviteLookup { .. }, StoreResult::Conversation(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+            }
+
+            // ---- ConvInvite: store complete → notify ----
+            (PendingKind::ConvInviteStore { conv_id, invitee, updated_members }, StoreResult::Stored(Ok(()))) => {
+                self.enqueue(conn_id, MsgType::ConvMemberEvent, &updated_members);
+                if let Some(conns) = self.user_connections.get(&invitee) {
+                    let targets: Vec<ConnectionId> = conns.clone();
+                    for target_id in targets {
+                        self.enqueue(target_id, MsgType::ConvMemberEvent, &updated_members);
+                    }
+                }
+                self.user_conversations.entry(invitee).or_default().insert(conv_id);
+            }
+            (PendingKind::ConvInviteStore { .. }, StoreResult::Stored(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
+            }
+
+            // ---- Inbox fetch (auth or explicit) ----
+            (PendingKind::InboxFetch { user_id, prefix, send_resp }, StoreResult::InboxRange(Ok(items))) => {
+                for (key, data) in &items {
+                    if key.starts_with(&prefix) && key.len() > prefix.len() {
+                        let rest = &key[prefix.len()..];
+                        let parts: Vec<&[u8]> = rest.split(|&b| b == b'/').collect();
+                        if parts.len() >= 2 {
+                            let conv_id = parts[0];
+                            let seq = if parts[1].len() >= 8 {
+                                let mut arr = [0u8; 8];
+                                arr.copy_from_slice(&parts[1][..8]);
+                                u64::from_be_bytes(arr)
+                            } else {
+                                continue;
+                            };
+                            self.deliver_to_connection(conn_id, &user_id, conv_id, seq, data);
+                            let _ = self.store.delete_inbox_async(key);
+                        }
+                    }
+                }
+                if send_resp {
+                    self.enqueue(conn_id, MsgType::InboxResp, &[]);
+                }
+            }
+            (PendingKind::InboxFetch { .. }, StoreResult::InboxRange(Err(e))) => {
+                self.enqueue(conn_id, MsgType::Error, format!("inbox: {e}").as_bytes());
+            }
+
+            _ => {}
+        }
     }
 }
 
@@ -311,7 +584,8 @@ impl EventHandler for Domain {
             MsgType::CreateConv => self.handle_create_conv(id, &frame.body),
             MsgType::ConvInvite => self.handle_conv_invite(id, &frame.body),
             MsgType::Send => self.handle_send(id, &frame.body),
-            MsgType::InboxFetch => self.handle_inbox_fetch(id, &frame.body),
+            MsgType::InboxFetch => self.handle_inbox_fetch(id),
+            MsgType::ListConvs => self.handle_list_convs(id),
             MsgType::Ping => self.enqueue(id, MsgType::Pong, &[]),
             MsgType::Presence => self.enqueue(id, MsgType::Presence, &frame.body),
             _ => {}
@@ -327,6 +601,10 @@ impl EventHandler for Domain {
                 }
             }
         }
+    }
+
+    fn tick(&mut self) {
+        self.tick();
     }
 
     fn drain_outbound(&mut self) -> Vec<(ConnectionId, Box<[u8]>)> {

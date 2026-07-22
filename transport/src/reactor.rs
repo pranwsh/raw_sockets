@@ -46,6 +46,11 @@ pub trait EventHandler {
     /// A connection has been fully closed and removed.
     fn on_teardown(&mut self, id: ConnectionId, reason: TeardownReason);
 
+    /// Called once per reactor tick after all I/O events have been dispatched.
+    /// Implementations should poll any pending async work (e.g. storage
+    /// results) and queue outbound frames / teardowns as needed.
+    fn tick(&mut self) {}
+
     /// Drain any outgoing frames queued by the handler.
     fn drain_outbound(&mut self) -> Vec<(ConnectionId, Box<[u8]>)> {
         Vec::new()
@@ -168,6 +173,14 @@ impl<H: EventHandler> Reactor<H> {
             }
         }
 
+        // Let the handler poll async work (e.g. storage results) and queue
+        // outbound frames.
+        self.handler.tick();
+
+        // Drain any frames/teardowns queued by tick() (or earlier by
+        // on_frame() handlers that were not drained inside handle_read).
+        self.drain_handler_queues();
+
         // Idle timeout sweep (only on ticks that didn't process events, to
         // keep the hot path fast; but we do it periodically by the 1s wait).
         self.sweep_timeouts();
@@ -232,20 +245,50 @@ impl<H: EventHandler> Reactor<H> {
         for frame in frames {
             self.handler.on_frame(id, frame);
         }
-        // Drain outbound frames and teardown requests.
+
+        // Drain outbound frames, tracking connections for backpressure.
+        let mut overflowed: Vec<ConnectionId> = Vec::new();
+        let mut written_targets: Vec<ConnectionId> = Vec::new();
         for (target_id, frame) in self.handler.drain_outbound() {
-            self.send_to(target_id, &frame);
-        }
-        for (teardown_id, reason) in self.handler.drain_teardowns() {
-            if let Some(conn) = self.connections.get_mut(&teardown_id) {
-                conn.start_teardown(reason);
+            match self.send_to(target_id, &frame) {
+                WriteOutcome::Overflow => overflowed.push(target_id),
+                WriteOutcome::Queued => written_targets.push(target_id),
+                _ => {}
             }
         }
+
+        // Tear down connections whose write buffer exceeded HARD_CAP.
+        for &target_id in &overflowed {
+            if let Some(conn) = self.connections.get_mut(&target_id) {
+                conn.start_teardown(TeardownReason::SlowClient);
+            }
+        }
+
+        // Apply backpressure to target connections with high write buffer.
+        for &target_id in &written_targets {
+            if let Some(conn) = self.connections.get_mut(&target_id) {
+                if conn.should_pause_reading() && conn.teardown.is_none() {
+                    conn.read_paused = true;
+                    let events =
+                        (libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
+                    let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, target_id.into());
+                }
+            }
+        }
+
+        // Also apply backpressure to the source connection (original behavior).
         if let Some(conn) = self.connections.get_mut(&id) {
-            if conn.should_pause_reading() {
+            if conn.should_pause_reading() && conn.teardown.is_none() {
                 conn.read_paused = true;
                 let events = (libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
                 let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, id.into());
+            }
+        }
+
+        // Drain teardown requests from the handler.
+        for (teardown_id, reason) in self.handler.drain_teardowns() {
+            if let Some(conn) = self.connections.get_mut(&teardown_id) {
+                conn.start_teardown(reason);
             }
         }
     }
@@ -311,7 +354,12 @@ impl<H: EventHandler> Reactor<H> {
                 // Normal write flush.
                 loop {
                     match conn.do_write() {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            conn.start_teardown(TeardownReason::PeerClosed);
+                            break;
+                        }
                         Ok(_) => {
                             if conn.is_write_empty() {
                                 conn.write_pending = false;
@@ -393,6 +441,42 @@ impl<H: EventHandler> Reactor<H> {
     /// Returns the number of connected clients.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Drain outbound frames and teardowns from the handler and apply them.
+    fn drain_handler_queues(&mut self) {
+        let mut overflowed: Vec<ConnectionId> = Vec::new();
+        let mut written_targets: Vec<ConnectionId> = Vec::new();
+        for (target_id, frame) in self.handler.drain_outbound() {
+            match self.send_to(target_id, &frame) {
+                WriteOutcome::Overflow => overflowed.push(target_id),
+                WriteOutcome::Queued => written_targets.push(target_id),
+                _ => {}
+            }
+        }
+
+        for &target_id in &overflowed {
+            if let Some(conn) = self.connections.get_mut(&target_id) {
+                conn.start_teardown(TeardownReason::SlowClient);
+            }
+        }
+
+        for &target_id in &written_targets {
+            if let Some(conn) = self.connections.get_mut(&target_id) {
+                if conn.should_pause_reading() && conn.teardown.is_none() {
+                    conn.read_paused = true;
+                    let events =
+                        (libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
+                    let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, target_id.into());
+                }
+            }
+        }
+
+        for (teardown_id, reason) in self.handler.drain_teardowns() {
+            if let Some(conn) = self.connections.get_mut(&teardown_id) {
+                conn.start_teardown(reason);
+            }
+        }
     }
 }
 

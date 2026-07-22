@@ -89,6 +89,10 @@ pub enum MsgType {
     InboxFetch = 35,
     InboxResp = 36,
 
+    // Conversation listing
+    ListConvs = 37,
+    ConvsResp = 38,
+
     // Routing (inter-node) — uses the same frame on a cluster-internal socket.
     RouteAnnounce = 40,
     RouteDeliver = 41,
@@ -124,6 +128,8 @@ impl MsgType {
             34 => Self::HistoryResp,
             35 => Self::InboxFetch,
             36 => Self::InboxResp,
+            37 => Self::ListConvs,
+            38 => Self::ConvsResp,
             40 => Self::RouteAnnounce,
             41 => Self::RouteDeliver,
             42 => Self::NodeHello,
