@@ -346,22 +346,34 @@ pub fn decode(buf: &[u8]) -> Decode<'_> {
 }
 
 // ----------------------------------------------------------------------------
-// crc32c (Castagnoli) — software implementation
+// crc32c (Castagnoli) — table-based implementation
 // ----------------------------------------------------------------------------
-// Software CRC32c with the Castagnoli polynomial 0x1EDC6F41 (reflected
-// 0x82F63B78). We cannot pull a dependency onto the hot path; this stays
-// in the protocol crate as pure Rust. A SIMD/table-based version is a
-// later optimization — correctness first, profile-guided optimization later.
+// Precomputed 256-entry lookup table for the Castagnoli polynomial
+// 0x1EDC6F41 (reflected 0x82F63B78). One table lookup + shift per byte
+// instead of 8 conditional branches. Generated at compile time via const.
 
 const CRC32C_POLY: u32 = 0x82F63B78;
+
+const CRC32C_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut _j = 0;
+        while _j < 8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ CRC32C_POLY } else { crc >> 1 };
+            _j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 pub fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in bytes {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ CRC32C_POLY } else { crc >> 1 };
-        }
+        crc = CRC32C_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     !crc
 }
