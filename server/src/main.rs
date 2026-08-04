@@ -1,6 +1,4 @@
-//! `msgd` — high-performance raw-socket messaging server.
-//!
-//! Usage: `msgd --bind 0.0.0.0:9723 --data /tmp/msgd.redb`
+//! msgd — high-performance raw-socket messaging server
 
 use domain::Domain;
 use storage::Store;

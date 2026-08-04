@@ -1,30 +1,4 @@
-//! Versioned binary framing protocol for the messaging service.
-//!
-//! Wire format (little-endian unless noted):
-//!
-//! ```text
-//!  +--------+--------+--------+--------+--------+--------+--------+--------+
-//!  | magic  | ver    | type/flags lo | type/flags hi | body len (u32 LE)  |
-//!  +--------+--------+--------+--------+--------+--------+--------+--------+
-//!  |                          body (len bytes)                              |
-//!  +------------------------------------------------------------------------+
-//!  |                       crc32c (u32 LE)                                  |
-//!  +------------------------------------------------------------------------+
-//! ```
-//!
-//! - `magic`    = `0x4D` ('M') — fast reject of unrelated traffic.
-//! - `ver`      = protocol version; mismatch returns a typed decode error and
-//!                lets the caller negotiate/select. Currently `1`.
-//! - `type/flags` is a u16: high nibble is flags (compress/ack/req/etc), low
-//!                12 bits are message type. Keeps the header tight at 8 bytes.
-//! - `body len`  = u32 LE, capped at `MAX_BODY_LEN` to bound buffering memory.
-//! - `crc32c`    = Castagnoli CRC32 over (everything from `ver` through end
-//!                of body) — detects wire corruption before dispatch.
-//!
-//! The crate is I/O-free: `Decoder` consumes `&[u8]` slices produced by the
-//! transport layer and `Frame::encode` produces owned `Bytes`-like output.
-//! The transport crate is responsible for feeding partial socket reads in to
-//! the decoder; this crate never touches a socket.
+//! versioned binary framing protocol for the messaging service
 
 #![forbid(unsafe_code)]
 
@@ -33,9 +7,7 @@ mod tests;
 
 use core::fmt;
 
-// ----------------------------------------------------------------------------
-// Constants
-// ----------------------------------------------------------------------------
+// constants
 
 pub const MAGIC: u8 = 0x4D;
 pub const VERSION: u8 = 1;
@@ -50,17 +22,13 @@ pub const FLAG_PRIORITY: u16 = 1 << 13;
 pub const FLAG_MASK: u16 = 0xE000;
 pub const TYPE_MASK: u16 = 0x1FFF;
 
-// ----------------------------------------------------------------------------
-// Message types
-// ----------------------------------------------------------------------------
+// message types
 
-/// All message types share one frame envelope. Adding a type is a
-/// backward-compatible change; receivers must ignore unknown types rather than
-/// tear the connection down (gated by protocol version).
+/// all message types share one frame envelope
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MsgType {
-    // Handshake / auth
+    // handshake / auth
     Hello = 1,
     AuthChallenge = 2,
     AuthResponse = 3,
@@ -68,11 +36,11 @@ pub enum MsgType {
     AuthFail = 5,
     Goodbye = 6,
 
-    // Account / presence
+    // account / presence
     Presence = 10,
     Typing = 11,
 
-    // Conversations
+    // conversations
     CreateConv = 20,
     ConvCreated = 21,
     ConvInvite = 22,
@@ -80,7 +48,7 @@ pub enum MsgType {
     ConvLeave = 24,
     ConvMemberEvent = 25,
 
-    // Messaging
+    // messaging
     Send = 30,
     Delivered = 31,
     Read = 32,
@@ -89,16 +57,16 @@ pub enum MsgType {
     InboxFetch = 35,
     InboxResp = 36,
 
-    // Conversation listing
+    // conversation listing
     ListConvs = 37,
     ConvsResp = 38,
 
-    // Routing (inter-node) — uses the same frame on a cluster-internal socket.
+    // routing (inter-node) — uses the same frame on a cluster-internal socket
     RouteAnnounce = 40,
     RouteDeliver = 41,
     NodeHello = 42,
 
-    // Control
+    // control
     Ping = 90,
     Pong = 91,
     Error = 99,
@@ -141,13 +109,9 @@ impl MsgType {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Frame
-// ----------------------------------------------------------------------------
+// frame
 
-/// A decoded frame. `body` is borrowed from the decoder buffer to avoid copies
-/// on the hot path; the caller can `to_owned()` when it needs to outlive the
-/// buffer (e.g. when dispatching off the event loop shard).
+/// a decoded frame
 #[derive(Clone, PartialEq, Eq)]
 pub struct Frame<'a> {
     pub version: u8,
@@ -174,7 +138,7 @@ impl<'a> Frame<'a> {
         self.flags & FLAG_ACK_REQ != 0
     }
 
-    /// Total on-the-wire length including header and CRC trailer.
+    /// total on-the-wire length including header and CRC trailer
     pub fn wire_len(&self) -> usize {
         HEADER_LEN + self.body.len() + TRAILER_LEN
     }
@@ -191,9 +155,7 @@ impl fmt::Debug for Frame<'_> {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Owned frame (for dispatch after the buffer is reused)
-// ----------------------------------------------------------------------------
+// owned frame (for dispatch after the buffer is reused)
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct OwnedFrame {
@@ -214,12 +176,9 @@ impl OwnedFrame {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Encoder
-// ----------------------------------------------------------------------------
+// encoder
 
-/// Encode a frame into `dst`. Caller guarantees `dst.len() >= frame.wire_len()`.
-/// Returns the number of bytes written.
+/// encode a frame into dst caller guarantees dst.len() >= frame.wire_len()
 pub fn encode_into(dst: &mut [u8], msg_type: MsgType, flags: u16, body: &[u8]) -> usize {
     let total = HEADER_LEN + body.len() + TRAILER_LEN;
     debug_assert!(dst.len() >= total, "encode_into: dst too small");
@@ -237,7 +196,7 @@ pub fn encode_into(dst: &mut [u8], msg_type: MsgType, flags: u16, body: &[u8]) -
     total
 }
 
-/// Convenience: produce an owned encoded buffer.
+/// convenience: produce an owned encoded buffer
 pub fn encode(msg_type: MsgType, flags: u16, body: &[u8]) -> Box<[u8]> {
     let total = HEADER_LEN + body.len() + TRAILER_LEN;
     let mut buf = vec![0u8; total].into_boxed_slice();
@@ -245,9 +204,7 @@ pub fn encode(msg_type: MsgType, flags: u16, body: &[u8]) -> Box<[u8]> {
     buf
 }
 
-/// Seal a buffer where the body has already been written at
-/// `buf[HEADER_LEN..HEADER_LEN+body_len]`. Writes the header and CRC in
-/// place, avoiding a redundant body copy. Returns the total wire length.
+/// seal a buffer where the body has already been written at buf[HEADER_LEN..HEADER_LEN+body_len] writes the header and CRC in place, avoiding a redundant body copy
 pub fn seal(buf: &mut [u8], msg_type: MsgType, flags: u16, body_len: usize) -> usize {
     let total = HEADER_LEN + body_len + TRAILER_LEN;
     debug_assert!(buf.len() >= total);
@@ -261,37 +218,30 @@ pub fn seal(buf: &mut [u8], msg_type: MsgType, flags: u16, body_len: usize) -> u
     total
 }
 
-// ----------------------------------------------------------------------------
-// Decoder
-// ----------------------------------------------------------------------------
+// decoder
 
-/// Result of a non-consuming decode attempt against an append-only buffer.
+/// result of a non-consuming decode attempt against an append-only buffer
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decode<'a> {
-    /// A complete frame was produced. Its bytes remain in the buffer until
-    /// the caller advances past `consumed`; this avoids a copy on paths that
-    /// can dispatch straight from the read buffer.
+    /// a complete frame was produced
     Complete { frame: Frame<'a>, consumed: usize },
-    /// Not enough bytes yet. Caller should read more and retry.
+    /// not enough bytes yet
     Need,
-    /// Unrecoverable: the caller must tear the connection down via the
-    /// single shared teardown path (transport crate), not ad-hoc per error.
+    /// unrecoverable: the caller must tear the connection down via the single shared teardown path (transport crate), not ad-hoc per error
     Err(DecodeError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// First byte isn't `MAGIC`. Stream is misaligned / not our protocol.
+    /// first byte isn't MAGIC stream is misaligned / not our protocol
     BadMagic,
-    /// Protocol version we don't speak. Caller may negotiate; default is reset.
+    /// protocol version we don't speak
     UnsupportedVersion(u8),
-    /// Unknown message type. Per spec, ignore rather than reset for forward-compat —
-    /// but the caller picks the policy; we surface it.
+    /// unknown message type
     UnknownMsgType(u16),
-    /// Declared body length exceeds `MAX_BODY_LEN` — almost certainly an attack
-    /// or a corrupt length field. Reset.
+    /// declared body length exceeds MAX_BODY_LEN — almost certainly an attack or a corrupt length field
     BodyTooLarge { declared: usize, max: usize },
-    /// CRC mismatch — corrupt frame on the wire. Reset, do not trust stream.
+    /// CRC mismatch — corrupt frame on the wire
     CrcMismatch,
 }
 
@@ -311,12 +261,7 @@ impl fmt::Display for DecodeError {
 
 impl core::error::Error for DecodeError {}
 
-/// Decode one frame from the front of `buf`. Does not mutate `buf`; caller
-/// advances by `consumed` only on `Complete`.
-///
-/// This is the only entry point used by the transport's read path. It is
-/// written to be branch-predictable on the happy path: header fits -> length
-/// plausible -> full frame fits -> crc ok.
+/// decode one frame from the front of buf does not mutate buf; caller advances by consumed only on Complete
 pub fn decode(buf: &[u8]) -> Decode<'_> {
     if buf.len() < HEADER_LEN {
         return Decode::Need;
@@ -361,12 +306,7 @@ pub fn decode(buf: &[u8]) -> Decode<'_> {
     }
 }
 
-// ----------------------------------------------------------------------------
-// crc32c (Castagnoli) — table-based implementation
-// ----------------------------------------------------------------------------
-// Precomputed 256-entry lookup table for the Castagnoli polynomial
-// 0x1EDC6F41 (reflected 0x82F63B78). One table lookup + shift per byte
-// instead of 8 conditional branches. Generated at compile time via const.
+// crc32c (castagnoli) — table-based implementation
 
 const CRC32C_POLY: u32 = 0x82F63B78;
 

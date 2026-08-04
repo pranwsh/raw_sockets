@@ -1,12 +1,4 @@
-//! Protocol unit tests — highest value in the project.
-//!
-//! Two categories are exercised exhaustively here because the rest of the
-//! system trusts them:
-//!   1. Split-at-arbitrary-byte-boundary: decode must yield `Need` for every
-//!      prefix and the same decoded frame after the full frame arrives, no
-//!      matter which byte boundary the transport slices on.
-//!   2. Malformed-input rejection: every `DecodeError` variant is hit and
-//!      the decoder never panics.
+//! protocol unit tests — highest value in the project
 
 use super::*;
 
@@ -60,16 +52,14 @@ fn flags_round_trip() {
 
 #[test]
 fn split_at_every_byte_boundary() {
-    // The transport may slice the wire stream at any byte offset; decoding any
-    // proper prefix must yield `Need` and the full buffer must decode to the
-    // expected frame. Run across multiple body sizes to cover short/long frames.
+    // the transport may slice the wire stream at any byte offset; decoding any proper prefix must yield Need and the full buffer must decode to the expected frame
     for body in [b"".as_slice(), b"x", b"the quick brown fox".as_slice()] {
         let full = sample_frame(MsgType::Send, body);
         for cut in 0..=full.len() {
             match decode(&full[..cut]) {
                 Decode::Need => {}
                 Decode::Complete { frame, consumed } => {
-                    // Only acceptable at full length.
+                    // only acceptable at full length
                     assert_eq!(cut, full.len(), "decode completed early at cut={cut}");
                     assert_eq!(frame.body, body);
                     assert_eq!(consumed, full.len());
@@ -104,9 +94,7 @@ fn multiple_frames_back_to_back() {
     assert_eq!(frames, 3);
 }
 
-// ----------------------------------------------------------------------------
-// Malformed-input rejection
-// ----------------------------------------------------------------------------
+// malformed-input rejection
 
 #[test]
 fn rejects_bad_magic() {
@@ -125,11 +113,10 @@ fn rejects_unsupported_version() {
 #[test]
 fn rejects_unknown_msg_type() {
     let mut buf = sample_frame(MsgType::Ping, &[]);
-    // Set type field to a reserved value (0). 0 is never emitted by MsgType.
+    // set type field to a reserved value (0)
     buf[2] = 0x00;
     buf[3] = 0x00;
-    // We corrupted the CRC too here; the type check fires first since it's
-    // before the length/body section, so we expect UnknownMsgType.
+    // we corrupted the CRC too here; the type check fires first since it's before the length/body section, so we expect UnknownMsgType
     assert_eq!(decode(&buf), Decode::Err(DecodeError::UnknownMsgType(0)));
 }
 
@@ -139,9 +126,9 @@ fn rejects_body_too_large() {
     buf[0] = MAGIC;
     buf[1] = VERSION;
     buf[2..4].copy_from_slice(&0u16.to_le_bytes()); // MsgType 0 survives until length check? No: UnknownMsgType first.
-    // Use a known-good type to reach the length check.
+    // use a known-good type to reach the length check
     buf[2..4].copy_from_slice(&(MsgType::Send as u16).to_le_bytes());
-    // Declare MAX_BODY_LEN+1.
+    // declare MAX_BODY_LEN+1
     let huge = (MAX_BODY_LEN as u32) + 1;
     buf[4..8].copy_from_slice(&huge.to_le_bytes());
     assert_eq!(
@@ -156,15 +143,14 @@ fn rejects_body_too_large() {
 #[test]
 fn rejects_corrupt_body_crc_mismatch() {
     let mut buf = sample_frame(MsgType::Send, b"corrupt me");
-    // Flip a body bit.
+    // flip a body bit
     buf[HEADER_LEN] ^= 0x01;
     assert_eq!(decode(&buf), Decode::Err(DecodeError::CrcMismatch));
 }
 
 #[test]
 fn rejects_corrupt_header_crc_mismatch() {
-    // Toggle the high (compress) flag bit while leaving MsgType intact, so the
-    // only decoder path remaining is CRC verification — which must reject.
+    // toggle the high (compress) flag bit while leaving MsgType intact, so the only decoder path remaining is CRC verification — which must reject
     let mut buf = sample_frame(MsgType::Ping, b"some body to crc");
     buf[3] ^= 0x80; // top flag bit (FLAG_COMPRESSED occupies bit 15)
     assert_eq!(decode(&buf), Decode::Err(DecodeError::CrcMismatch));
@@ -184,7 +170,6 @@ fn sub_header_length_needs_more() {
 
 #[test]
 fn crc_is_castagnoli() {
-    // Known-vector sanity check for crc32c against RFC 4960 / widely cited
-    // reference: crc32c of "123456789" = 0xE3069283.
+    // known-vector sanity check for crc32c against RFC 4960 / widely cited reference: crc32c of "123456789" = 0xE3069283
     assert_eq!(crc32c(b"123456789"), 0xE3069283);
 }

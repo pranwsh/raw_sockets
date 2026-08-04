@@ -1,18 +1,4 @@
-//! Embedded persistent store (redb) with non-blocking offload.
-//!
-//! The [`Store`] handle is `Send + Sync` and `Clone`. It communicates with a
-//! dedicated background thread that owns the `redb::Database`. All operations
-//! are dispatched through a channel and acknowledged via oneshot response
-//! channels, keeping the event loop thread free of synchronous I/O.
-//!
-//! The background thread is a simple poll loop over an incoming channel.
-//! It processes one operation at a time — redb is single-writer already, so
-//! serializing at this level adds no contention that wouldn't exist anyway.
-//!
-//! **Async API**: Every operation has an `_async` variant that returns an
-//! `mpsc::Receiver<StoreResult>` immediately. The caller polls with
-//! `try_recv()` on its own tick, avoiding any blocking on the event-loop
-//! thread. The blocking variants remain for convenience in tests and the CLI.
+//! embedded persistent store (redb) with non-blocking offload
 
 #![forbid(unsafe_code)]
 
@@ -20,9 +6,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-// ---------------------------------------------------------------------------
-// Table definitions
-// ---------------------------------------------------------------------------
+// table definitions
 
 static TABLE_ACCOUNTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("accounts_v1");
 static TABLE_CONVERSATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("conversations_v1");
@@ -31,10 +15,7 @@ static TABLE_INBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_
 static TABLE_MESSAGE_LOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("message_log_v1");
 static TABLE_SEQUENCE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sequence_v1");
 
-// ---------------------------------------------------------------------------
 // StoreResult — type-erased response so every async method returns the same
-// Receiver<T>.
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub enum StoreResult {
@@ -45,9 +26,7 @@ pub enum StoreResult {
     Stored(Result<(), StoreError>),
 }
 
-// ---------------------------------------------------------------------------
-// Op enum
-// ---------------------------------------------------------------------------
+// op enum
 
 enum Op {
     PutAccount { user_id: Vec<u8>, data: Vec<u8>, tx: Sender<StoreResult> },
@@ -61,9 +40,7 @@ enum Op {
     Shutdown,
 }
 
-// ---------------------------------------------------------------------------
 // StoreError
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -82,9 +59,7 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-// ---------------------------------------------------------------------------
-// Store handle
-// ---------------------------------------------------------------------------
+// store handle
 
 #[derive(Clone)]
 pub struct Store {
@@ -92,8 +67,7 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (or create) the database at `path` and spawn the background
-    /// worker thread. Returns the handle.
+    /// open (or create) the database at path and spawn the background worker thread
     pub fn open(path: &str) -> Result<Self, StoreError> {
         let db = Database::create(path).map_err(|e| StoreError::Redb(e.to_string()))?;
         let (tx, rx) = mpsc::channel::<Op>();
@@ -105,9 +79,7 @@ impl Store {
         self.tx.send(op).map_err(|_| StoreError::Channel)
     }
 
-    // -------------------------------------------------------------------
-    // Async API — returns immediately, caller polls with try_recv()
-    // -------------------------------------------------------------------
+    // async API — returns immediately, caller polls with try_recv()
 
     pub fn put_account_async(&self, user_id: &[u8], data: &[u8]) -> Result<Receiver<StoreResult>, StoreError> {
         let (tx, rx) = mpsc::channel();
@@ -157,9 +129,7 @@ impl Store {
         Ok(rx)
     }
 
-    // -------------------------------------------------------------------
-    // Blocking API — convenience for tests and CLI
-    // -------------------------------------------------------------------
+    // blocking API — convenience for tests and CLI
 
     fn recv_blocking(rx: Receiver<StoreResult>) -> Result<StoreResult, StoreError> {
         rx.recv().map_err(|_| StoreError::Channel)
@@ -234,15 +204,13 @@ impl Store {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Worker thread
-// ---------------------------------------------------------------------------
+// worker thread
 
 fn spawn_worker(db: Database, rx: Receiver<Op>) -> JoinHandle<()> {
     thread::Builder::new()
         .name("store-worker".into())
         .spawn(move || {
-            // Ensure all tables exist (write transaction auto-creates).
+            // ensure all tables exist (write transaction auto-creates)
             if let Ok(txn) = db.begin_write() {
                 let _ = txn.open_table(TABLE_ACCOUNTS);
                 let _ = txn.open_table(TABLE_CONVERSATIONS);
