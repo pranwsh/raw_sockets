@@ -28,7 +28,6 @@ struct Shell {
     cmd_rx: mpsc::Receiver<String>,
     listening: Arc<AtomicBool>,
     authenticated: bool,
-    token: Option<Vec<u8>>,
     user_id: Option<String>,
     conversations: Vec<ConvInfo>,
 }
@@ -37,7 +36,7 @@ impl Shell {
     fn new(host: &str, port: u16) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
 
-        // Spawn stdin reader thread
+        // spawn stdin reader thread
         thread::spawn(move || {
             let stdin = io::stdin();
             let mut buf = String::new();
@@ -66,7 +65,6 @@ impl Shell {
             cmd_rx,
             listening: Arc::new(AtomicBool::new(true)),
             authenticated: false,
-            token: None,
             user_id: None,
             conversations: Vec::new(),
         }
@@ -78,10 +76,10 @@ impl Shell {
         self.print_help(&mut stdout);
 
         loop {
-            // Check for incoming frames first (non-blocking)
+            // check for incoming frames first (non-blocking)
             self.drain_and_print_frames(&mut stdout);
 
-            // Check for commands from stdin thread
+            // check for commands from stdin thread
             match self.cmd_rx.try_recv() {
                 Ok(line) => {
                     if line.is_empty() {
@@ -92,7 +90,7 @@ impl Shell {
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    // No command available, sleep briefly to avoid busy-wait
+                    // no command available, sleep briefly to avoid busy-wait
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -106,8 +104,7 @@ impl Shell {
     fn print_help(&self, w: &mut impl Write) {
         let _ = writeln!(w, "Commands:");
         let _ = writeln!(w, "  connect              Connect to {}:{}", self.host, self.port);
-        let _ = writeln!(w, "  hello <user_id>      Authenticate (send Hello)");
-        let _ = writeln!(w, "  auth-response <token_hex>  Respond to auth challenge");
+        let _ = writeln!(w, "  hello <user_id> <password>  Authenticate (create or log in)");
         let _ = writeln!(w, "  create-conv <members> Create conversation (comma-separated)");
         let _ = writeln!(w, "  convs                List known conversations (local cache)");
         let _ = writeln!(w, "  list-convs           List conversations from the server");
@@ -126,18 +123,11 @@ impl Shell {
         match cmd {
             "connect" => self.cmd_connect(w),
             "hello" => {
-                if parts.len() < 2 {
-                    let _ = writeln!(w, "usage: hello <user_id>");
+                if parts.len() < 3 {
+                    let _ = writeln!(w, "usage: hello <user_id> <password>");
                     return true;
                 }
-                self.cmd_hello(parts[1], w)
-            }
-            "auth-response" => {
-                if parts.len() < 2 {
-                    let _ = writeln!(w, "usage: auth-response <token_hex>");
-                    return true;
-                }
-                self.cmd_auth_response(parts[1], w)
+                self.cmd_hello(parts[1], parts[2], w)
             }
             "create-conv" => {
                 if parts.len() < 2 {
@@ -212,7 +202,6 @@ impl Shell {
         self.frame_rx = Some(rx);
         self._reader = Some(handle);
         self.authenticated = false;
-        self.token = None;
         self.user_id = None;
 
         let _ = writeln!(w, "connected to {}", addr);
@@ -230,12 +219,11 @@ impl Shell {
         self.frame_rx = None;
         self._reader = None;
         self.authenticated = false;
-        self.token = None;
         self.user_id = None;
         let _ = writeln!(w, "disconnected");
     }
 
-    fn cmd_hello(&mut self, user_id: &str, w: &mut impl Write) -> bool {
+    fn cmd_hello(&mut self, user_id: &str, password: &str, w: &mut impl Write) -> bool {
         let writer = match self.writer.as_ref() {
             Some(s) => s,
             None => {
@@ -244,7 +232,11 @@ impl Shell {
             }
         };
 
-        let frame = protocol::encode(MsgType::Hello, 0, user_id.as_bytes());
+        let mut body = Vec::new();
+        body.extend_from_slice(user_id.as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(password.as_bytes());
+        let frame = protocol::encode(MsgType::Hello, 0, &body);
         if let Err(e) = writer_write(writer, &frame) {
             let _ = writeln!(w, "write error: {}", e);
             return true;
@@ -256,61 +248,20 @@ impl Shell {
                 let _ = writeln!(w, "received: {}", format_frame(&f));
                 match f.msg_type {
                     MsgType::AuthOk => {
-                        self.token = Some(f.body.to_vec());
+                        let created = f.body.first() == Some(&1);
                         self.authenticated = true;
-                        let _ = writeln!(w, "authenticated (token: {})", hex::encode(&f.body));
+                        if created {
+                            let _ = writeln!(w, "account created and authenticated");
+                        } else {
+                            let _ = writeln!(w, "authenticated");
+                        }
                     }
-                    MsgType::AuthChallenge => {
-                        let _ = writeln!(w, "auth challenged — send 'auth-response <token_hex>'");
+                    MsgType::AuthFail => {
+                        let _ = writeln!(w, "auth failed: {}", String::from_utf8_lossy(&f.body));
                     }
                     _ => {
                         let _ = writeln!(w, "unexpected response to hello");
                     }
-                }
-            }
-            Err(e) => {
-                let _ = writeln!(w, "recv error: {}", e);
-            }
-        }
-        true
-    }
-
-    fn cmd_auth_response(&mut self, token_hex: &str, w: &mut impl Write) -> bool {
-        let writer = match self.writer.as_ref() {
-            Some(s) => s,
-            None => {
-                let _ = writeln!(w, "not connected");
-                return true;
-            }
-        };
-
-        let token = match hex::decode(token_hex) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = writeln!(w, "invalid hex: {}", e);
-                return true;
-            }
-        };
-
-        let user_id = self.user_id.as_deref().unwrap_or_default();
-        let mut body = Vec::new();
-        body.extend_from_slice(user_id.as_bytes());
-        body.push(b'\n');
-        body.extend_from_slice(&token);
-
-        let frame = protocol::encode(MsgType::AuthResponse, 0, &body);
-        if let Err(e) = writer_write(writer, &frame) {
-            let _ = writeln!(w, "write error: {}", e);
-            return true;
-        }
-
-        match self.next_frame() {
-            Ok(f) => {
-                let _ = writeln!(w, "received: {}", format_frame(&f));
-                if f.msg_type == MsgType::AuthOk {
-                    self.token = Some(f.body.to_vec());
-                    self.authenticated = true;
-                    let _ = writeln!(w, "authenticated");
                 }
             }
             Err(e) => {
@@ -495,9 +446,6 @@ impl Shell {
         if let Some(ref uid) = self.user_id {
             let _ = writeln!(w, "user: {}", uid);
         }
-        if let Some(ref tok) = self.token {
-            let _ = writeln!(w, "token: {}", hex::encode(tok));
-        }
         let _ = writeln!(w, "listening: {}", self.listening.load(Ordering::Relaxed));
         let _ = writeln!(w, "conversations: {}", self.conversations.len());
         true
@@ -525,7 +473,7 @@ impl Shell {
                 Ok(f) => {
                     let formatted = format_frame(&f);
                     let _ = writeln!(w, "\r[incoming] {}", formatted);
-                    // Track conversations from incoming Send frames
+                    // track conversations from incoming send frames
                     if f.msg_type == MsgType::Send {
                         if let Some(sep) = f.body.iter().position(|&b| b == b'\n') {
                             let conv_id = f.body[..sep].to_vec();
@@ -627,7 +575,14 @@ fn read_frames(mut reader: TcpStream, tx: mpsc::Sender<OwnedFrame>, _listening: 
 
 fn format_frame(f: &OwnedFrame) -> String {
     match f.msg_type {
-        MsgType::AuthOk => format!("AuthOk ({} bytes)", f.body.len()),
+        MsgType::AuthOk => {
+            let created = f.body.first() == Some(&1);
+            if created {
+                "AuthOk (new account)".to_string()
+            } else {
+                "AuthOk".to_string()
+            }
+        }
         MsgType::AuthChallenge => format!(
             "AuthChallenge: {}",
             String::from_utf8_lossy(&f.body)

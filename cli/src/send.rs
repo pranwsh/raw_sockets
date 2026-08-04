@@ -8,9 +8,9 @@ pub fn run(
     host: &str,
     port: u16,
     user: &str,
+    password: &str,
     conv: Option<&str>,
     create: Option<&str>,
-    token: Option<&str>,
     message: &str,
     listen: bool,
 ) {
@@ -24,7 +24,7 @@ pub fn run(
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
 
-    if let Err(e) = do_auth(&mut stream, user.as_bytes(), token) {
+    if let Err(e) = do_auth(&mut stream, user.as_bytes(), password.as_bytes()) {
         eprintln!("error: auth failed: {}", e);
         let _ = stream.shutdown(std::net::Shutdown::Both);
         std::process::exit(1);
@@ -71,37 +71,29 @@ pub fn run(
     let _ = stream.flush();
 }
 
-fn do_auth(stream: &mut TcpStream, user_id: &[u8], token: Option<&str>) -> Result<(), String> {
-    let hello = protocol::encode(MsgType::Hello, 0, user_id);
+fn do_auth(stream: &mut TcpStream, user_id: &[u8], password: &[u8]) -> Result<(), String> {
+    let mut body = Vec::new();
+    body.extend_from_slice(user_id);
+    body.push(b'\n');
+    body.extend_from_slice(password);
+    let hello = protocol::encode(MsgType::Hello, 0, &body);
     stream.write_all(&hello).map_err(|e| format!("write error: {}", e))?;
 
     let frame = recv_frame(stream).map_err(|e| format!("recv error: {}", e))?;
 
     match frame.msg_type {
         MsgType::AuthOk => {
-            let tok = frame.body.to_vec();
-            eprintln!("auth ok (new account, save this token: {})", hex::encode(&tok));
+            let created = frame.body.first() == Some(&1);
+            if created {
+                eprintln!("auth ok (new account created)");
+            } else {
+                eprintln!("auth ok (authenticated)");
+            }
             Ok(())
         }
-        MsgType::AuthChallenge => {
-            let tok_hex = token.ok_or_else(|| {
-                "server requires auth token (previous session). use --token <hex>".to_string()
-            })?;
-            let tok = hex::decode(tok_hex).map_err(|e| format!("invalid token hex: {}", e))?;
-
-            let mut body = Vec::new();
-            body.extend_from_slice(user_id);
-            body.push(b'\n');
-            body.extend_from_slice(&tok);
-            let resp = protocol::encode(MsgType::AuthResponse, 0, &body);
-            stream.write_all(&resp).map_err(|e| format!("write error: {}", e))?;
-
-            let frame = recv_frame(stream).map_err(|e| format!("recv error: {}", e))?;
-            if frame.msg_type != MsgType::AuthOk {
-                return Err(format!("auth failed: {:?}", frame.msg_type));
-            }
-            eprintln!("auth ok (reconnected)");
-            Ok(())
+        MsgType::AuthFail => {
+            let reason = String::from_utf8_lossy(&frame.body);
+            Err(format!("server rejected credentials: {}", reason))
         }
         _ => Err(format!("unexpected response to hello: {:?}", frame.msg_type)),
     }
