@@ -1,8 +1,4 @@
-//! Integration tests that spawn a server instance and speak the binary protocol
-//! over real TCP sockets.
-//!
-//! Each test starts a server on a random port, connects a client, performs the
-//! auth handshake, and verifies application-level semantics.
+//! integration tests that spawn a server instance and speak the binary protocol over real TCP sockets
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, SocketAddr};
@@ -10,23 +6,20 @@ use std::process::{Command, Child};
 use std::thread;
 use std::time::Duration;
 
-// Reuse the workspace's protocol crate for frame encoding/decoding.
-// This is the actual protocol logic — the test verifies that the server
-// speaks it correctly.
+// reuse the workspace's protocol crate for frame encoding/decoding
+// this is the actual protocol logic — the test verifies that the server speaks it correctly
 use protocol::{self, MsgType, OwnedFrame, Decode};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// helpers
 
-/// Wraps a child process and kills it on drop.
+/// wraps a child process and kills it on drop
 struct ServerGuard {
     child: Option<Child>,
 }
 
 impl ServerGuard {
     fn new(child: Child) -> Self {
-        // Give the server time to start.
+        // give the server time to start
         thread::sleep(Duration::from_millis(200));
         Self { child: Some(child) }
     }
@@ -41,8 +34,7 @@ impl Drop for ServerGuard {
     }
 }
 
-/// Spawn a `msgd` instance on a random port. Returns a guard that kills the
-/// server on drop, and the bound address.
+/// spawn a msgd instance on a random port
 fn spawn_server() -> (ServerGuard, SocketAddr) {
     let port = portpicker();
     let data_path = format!("/tmp/msgd_test_{}", port);
@@ -61,12 +53,12 @@ fn spawn_server() -> (ServerGuard, SocketAddr) {
 }
 
 fn portpicker() -> u16 {
-    // Bind to port 0, get the assigned port, close.
+    // bind to port 0, get the assigned port, close
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
 
-/// A thin client that sends/receives frames over a TCP stream.
+/// a thin client that sends/receives frames over a TCP stream
 struct TestClient {
     stream: TcpStream,
     buf: Vec<u8>,
@@ -81,32 +73,25 @@ impl TestClient {
         Ok(Self { stream, buf: Vec::with_capacity(65536), read_offset: 0 })
     }
 
-    /// Send a raw frame.
+    /// send a raw frame
     fn send_frame(&mut self, msg_type: MsgType, flags: u16, body: &[u8]) {
         let frame = protocol::encode(msg_type, flags, body);
         self.stream.write_all(&frame).unwrap();
     }
 
-    /// Send a `Hello(user_id)` frame.
-    fn hello(&mut self, user_id: &[u8]) {
-        self.send_frame(MsgType::Hello, 0, user_id);
-    }
-
-    /// Send an `AuthResponse(user_id \n token)` frame.
-    fn auth_response(&mut self, user_id: &[u8], token: &[u8]) {
+    /// send a Hello(user_id \n password) frame
+    fn hello(&mut self, user_id: &[u8], password: &[u8]) {
         let mut body = Vec::new();
         body.extend_from_slice(user_id);
         body.push(b'\n');
-        body.extend_from_slice(token);
-        self.send_frame(MsgType::AuthResponse, 0, &body);
+        body.extend_from_slice(password);
+        self.send_frame(MsgType::Hello, 0, &body);
     }
 
-    /// Read and decode exactly one frame from the stream. Blocks until a
-    /// complete frame is available.
+    /// read and decode exactly one frame from the stream
     fn recv_frame(&mut self) -> OwnedFrame {
         loop {
-            // Extract owned frame data and consumed count in a scope that
-            // releases the borrow on self.buf before we modify it.
+            // extract owned frame data and consumed count in a scope that releases the borrow on self.buf before we modify it
             let consumed;
             let owned = {
                 let buf_slice = &self.buf[self.read_offset..];
@@ -147,22 +132,20 @@ impl Drop for TestClient {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// tests
 
 #[test]
 fn test_auth_handshake_new_account() {
     let (_server, addr) = spawn_server();
     let mut client = TestClient::connect(addr).unwrap();
 
-    // Send Hello.
-    client.hello(b"alice");
+    // send hello with the user-chosen password
+    client.hello(b"alice", b"hunter2");
 
-    // Expect AuthOk with a 32-byte token.
+    // expect AuthOk with a 1-byte "new account" flag
     let resp = client.recv_frame();
     assert_eq!(resp.msg_type, MsgType::AuthOk, "expected AuthOk, got {:?}", resp.msg_type);
-    assert_eq!(resp.body.len(), 32, "token should be 32 bytes");
+    assert_eq!(resp.body.first(), Some(&1), "new account should be flagged with 1");
 }
 
 #[test]
@@ -170,25 +153,38 @@ fn test_auth_handshake_reconnect() {
     let (_server, addr) = spawn_server();
     let mut client = TestClient::connect(addr).unwrap();
 
-    // Register alice.
-    client.hello(b"alice");
+    // register alice with a password
+    client.hello(b"alice", b"hunter2");
     let resp = client.recv_frame();
     assert_eq!(resp.msg_type, MsgType::AuthOk);
-    let token = resp.body.to_vec(); // copy before dropping client
+    assert_eq!(resp.body.first(), Some(&1));
 
-    // Disconnect and reconnect.
+    // disconnect and reconnect with the same password
     drop(client);
     let mut client2 = TestClient::connect(addr).unwrap();
 
-    // Send Hello for existing account — expect AuthChallenge.
-    client2.hello(b"alice");
-    let challenge = client2.recv_frame();
-    assert_eq!(challenge.msg_type, MsgType::AuthChallenge);
-
-    // Respond with the token we saved earlier.
-    client2.auth_response(b"alice", &token);
+    client2.hello(b"alice", b"hunter2");
     let ok = client2.recv_frame();
     assert_eq!(ok.msg_type, MsgType::AuthOk);
+    assert_eq!(ok.body.first(), Some(&0), "existing account should be flagged with 0");
+}
+
+#[test]
+fn test_auth_wrong_password() {
+    let (_server, addr) = spawn_server();
+    let mut client = TestClient::connect(addr).unwrap();
+
+    client.hello(b"alice", b"hunter2");
+    let resp = client.recv_frame();
+    assert_eq!(resp.msg_type, MsgType::AuthOk);
+
+    drop(client);
+    let mut client2 = TestClient::connect(addr).unwrap();
+
+    // wrong password must be rejected
+    client2.hello(b"alice", b"wrong-pass");
+    let fail = client2.recv_frame();
+    assert_eq!(fail.msg_type, MsgType::AuthFail, "expected AuthFail, got {:?}", fail.msg_type);
 }
 
 #[test]
@@ -196,27 +192,25 @@ fn test_create_conv_and_send() {
     let (_server, addr) = spawn_server();
     let mut alice = TestClient::connect(addr).unwrap();
 
-    // Register alice.
-    alice.hello(b"alice");
+    // register alice
+    alice.hello(b"alice", b"hunter2");
     let resp = alice.recv_frame();
     assert_eq!(resp.msg_type, MsgType::AuthOk);
 
-    // Create conversation: "alice,bob"
+    // create conversation: "alice,bob"
     alice.send_frame(MsgType::CreateConv, 0, b"alice,bob");
     let created = alice.recv_frame();
     assert_eq!(created.msg_type, MsgType::ConvCreated);
     let conv_id = created.body.to_vec();
 
-    // Send a message to the conversation.
+    // send a message to the conversation
     let mut msg = Vec::new();
     msg.extend_from_slice(&conv_id);
     msg.push(b'\n');
     msg.extend_from_slice(b"Hello, Bob!");
     alice.send_frame(MsgType::Send, 0, &msg);
 
-    // The send triggers: (1) a Send frame echoing the message back to the
-    // sender (inbox delivery), then (2) a Delivered ack. Read until we see
-    // Delivered.
+    // the send triggers: (1) a send frame echoing the message back to the sender (inbox delivery), then (2) a delivered ack
     loop {
         let f = alice.recv_frame();
         if f.msg_type == MsgType::Delivered {
@@ -230,7 +224,7 @@ fn test_ping_pong() {
     let (_server, addr) = spawn_server();
     let mut client = TestClient::connect(addr).unwrap();
 
-    client.hello(b"pinger");
+    client.hello(b"pinger", b"pong-pass");
     let resp = client.recv_frame();
     assert_eq!(resp.msg_type, MsgType::AuthOk);
 
