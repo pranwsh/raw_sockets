@@ -1,9 +1,4 @@
-//! Benchmarks: throughput and latency of the messaging server.
-//!
-//! Measures end-to-end round-trip latency (Hello → AuthOk) and sustained
-//! throughput under concurrent clients.
-//!
-//! Run with: `cargo bench -p server`
+//! benchmarks: throughput and latency of the messaging server
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use std::io::{Read, Write};
@@ -14,9 +9,7 @@ use std::time::{Duration, Instant};
 
 use protocol::{self, MsgType, Decode, OwnedFrame};
 
-// ---------------------------------------------------------------------------
-// Helper: spawn a server instance
-// ---------------------------------------------------------------------------
+// helper: spawn a server instance
 
 static SERVER_LOCK: Mutex<()> = Mutex::new(());
 
@@ -53,27 +46,29 @@ fn portpicker() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-// ---------------------------------------------------------------------------
-// Benchmarked operations
-// ---------------------------------------------------------------------------
+// benchmarked operations
 
 fn auth_round_trip(addr: SocketAddr) -> Duration {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let user_id = b"bench_user";
+    let mut hello_body = Vec::new();
+    hello_body.extend_from_slice(user_id);
+    hello_body.push(b'\n');
+    hello_body.extend_from_slice(b"benchpass");
 
-    let hello_frame = protocol::encode(MsgType::Hello, 0, user_id);
+    let hello_frame = protocol::encode(MsgType::Hello, 0, &hello_body);
     let start = Instant::now();
     stream.write_all(&hello_frame).unwrap();
 
-    // Read response (AuthOk).
+    // read response (AuthOk)
     let mut buf = vec![0u8; 8192];
     let mut offset = 0;
     loop {
         match protocol::decode(&buf[..offset]) {
             Decode::Complete { consumed, .. } => {
                 let elapsed = start.elapsed();
-                // Consume the rest of the frame.
+                // consume the rest of the frame
                 return elapsed;
             }
             Decode::Need => {
@@ -90,8 +85,12 @@ fn ping_round_trip(addr: SocketAddr) -> Duration {
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let user_id = b"ping_bench";
 
-    // Authenticate first.
-    let hello = protocol::encode(MsgType::Hello, 0, user_id);
+    // authenticate first
+    let mut hello_body = Vec::new();
+    hello_body.extend_from_slice(user_id);
+    hello_body.push(b'\n');
+    hello_body.extend_from_slice(b"benchpass");
+    let hello = protocol::encode(MsgType::Hello, 0, &hello_body);
     stream.write_all(&hello).unwrap();
     let mut buf = vec![0u8; 8192];
     let mut offset = 0;
@@ -110,7 +109,7 @@ fn ping_round_trip(addr: SocketAddr) -> Duration {
         }
     }
 
-    // Measure ping-pong.
+    // measure ping-pong
     let ping = protocol::encode(MsgType::Ping, 0, &[]);
     let start = Instant::now();
     stream.write_all(&ping).unwrap();
@@ -135,8 +134,12 @@ fn send_round_trip(addr: SocketAddr) -> Duration {
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let user_id = b"send_bench";
 
-    // Authenticate.
-    let hello = protocol::encode(MsgType::Hello, 0, user_id);
+    // authenticate
+    let mut hello_body = Vec::new();
+    hello_body.extend_from_slice(user_id);
+    hello_body.push(b'\n');
+    hello_body.extend_from_slice(b"benchpass");
+    let hello = protocol::encode(MsgType::Hello, 0, &hello_body);
     stream.write_all(&hello).unwrap();
     let mut buf = vec![0u8; 8192];
     let mut offset = 0;
@@ -155,8 +158,7 @@ fn send_round_trip(addr: SocketAddr) -> Duration {
         }
     }
 
-    // Create a conversation with a second user so the send path is exercised
-    // (conversation lookup, sequence allocation, delivery).
+    // create a conversation with a second user so the send path is exercised (conversation lookup, sequence allocation, delivery)
     let conv_body = b"send_bench,recv_bench";
     stream.write_all(&protocol::encode(MsgType::CreateConv, 0, conv_body)).unwrap();
     let conv_id;
@@ -180,7 +182,7 @@ fn send_round_trip(addr: SocketAddr) -> Duration {
         }
     }
 
-    // Measure Send → Delivered round-trip.
+    // measure send → delivered round-trip
     let mut msg = Vec::new();
     msg.extend_from_slice(&conv_id);
     msg.push(b'\n');
@@ -207,9 +209,7 @@ fn send_round_trip(addr: SocketAddr) -> Duration {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Criterion benches
-// ---------------------------------------------------------------------------
+// criterion benches
 
 fn bench_auth_latency(c: &mut Criterion) {
     let server = spawn_server();
@@ -220,7 +220,7 @@ fn bench_auth_latency(c: &mut Criterion) {
         })
     });
 
-    // Server drops when `server` goes out of scope.
+    // server drops when server goes out of scope
     drop(server);
 }
 
