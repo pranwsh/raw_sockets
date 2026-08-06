@@ -503,7 +503,7 @@ dependencies = [
 [[package]]
 name = "msgtui"
 version = "0.1.0"
-source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#6df1025a39491d40e0e53fefb01ba25e770b0100"
+source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#2f120f9251dd36f78aa8bcbf463b4ffca870f556"
 dependencies = [
  "hex",
  "term_render",
@@ -826,7 +826,7 @@ dependencies = [
 [[package]]
 name = "term_render"
 version = "0.1.3"
-source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#6df1025a39491d40e0e53fefb01ba25e770b0100"
+source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#2f120f9251dd36f78aa8bcbf463b4ffca870f556"
 dependencies = [
  "crossbeam",
  "crossterm",
@@ -839,7 +839,7 @@ dependencies = [
 [[package]]
 name = "term_render_macros"
 version = "0.1.0"
-source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#6df1025a39491d40e0e53fefb01ba25e770b0100"
+source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#2f120f9251dd36f78aa8bcbf463b4ffca870f556"
 dependencies = [
  "quote",
  "syn 2.0.119",
