@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddrV4;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 pub const USER_ID_MAX_LEN: usize = 256;
 pub const PASSWORD_MAX_LEN: usize = 256;
@@ -148,8 +149,26 @@ impl Domain {
     }
 
     fn establish_session(&mut self, id: ConnectionId, user_id: Vec<u8>) {
+        // idempotent re-auth: a client could authenticate twice on the same
+        // connection (the TUI adapter used to send Hello both at connect time
+        // and on startup). A duplicate registration pushed this conn id into
+        // `user_connections` twice, so live delivery targeted the same socket
+        // twice — every received message was delivered duplicated — and the
+        // redundant inbox fetch re-delivered queued offline messages. Guard
+        // against re-establishing the same user on an already-authenticated
+        // connection.
+        let already_authed = matches!(
+            self.sessions.get(&id),
+            Some(s) if s.authenticated && s.user_id == user_id
+        );
+        if already_authed {
+            return;
+        }
         self.sessions.insert(id, Session { user_id: user_id.clone(), authenticated: true });
-        self.user_connections.entry(user_id.clone()).or_default().push(id);
+        let conns = self.user_connections.entry(user_id.clone()).or_default();
+        if !conns.contains(&id) {
+            conns.push(id);
+        }
         let prefix = inbox_prefix_user(&user_id);
         let rx = match self.store.get_inbox_range_async(&prefix, 100) {
             Ok(rx) => rx,
@@ -326,19 +345,36 @@ impl Domain {
     // async result processing
 
     fn tick(&mut self) {
-        let mut i = 0;
-        while i < self.pending_ops.len() {
-            match self.pending_ops[i].rx.try_recv() {
-                Ok(result) => {
-                    let op = self.pending_ops.swap_remove(i);
-                    self.process_pending_result(op.conn_id, op.kind, result);
+        // A Send runs through two sequential async store hops (conversation
+        // lookup → next_sequence), each producing a result on a oneshot
+        // channel. Draining those results only here, once per reactor tick,
+        // would let each hop wait ~one epoll wake-up before being observed —
+        // up to ~epoll_wait timeout per hop. To collapse that, after the first
+        // drain pass we keep looping (non-blocking) for a short wall-clock
+        // budget so both hops can resolve within a single reactor wake whenever
+        // the store worker keeps up (the common case).
+        const SPIN_BUDGET: Duration = Duration::from_millis(1);
+        let deadline = Instant::now() + SPIN_BUDGET;
+        loop {
+            let mut progressed = false;
+            let mut i = 0;
+            while i < self.pending_ops.len() {
+                match self.pending_ops[i].rx.try_recv() {
+                    Ok(result) => {
+                        let op = self.pending_ops.swap_remove(i);
+                        self.process_pending_result(op.conn_id, op.kind, result);
+                        progressed = true;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        i += 1;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.pending_ops.swap_remove(i);
+                    }
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    i += 1;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.pending_ops.swap_remove(i);
-                }
+            }
+            if !progressed || Instant::now() >= deadline {
+                break;
             }
         }
     }
