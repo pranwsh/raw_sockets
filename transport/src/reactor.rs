@@ -123,8 +123,12 @@ impl<H: EventHandler> Reactor<H> {
             return Ok(());
         }
 
-        // compute max sleep: cap at idle check interval (1 second)
-        let max_wait_ms: libc::c_int = 1000;
+        // Wait at most ~10ms so the Domain's async store-result drain runs
+        // promptly even when the connection is otherwise idle. A Send needs two
+        // sequential store round-trips; with a 1s timeout each hop could wait
+        // up to 1s for the next epoll wake-up (~2s end-to-end). At 10ms the
+        // worst case drops to ~20ms while busy loops still return immediately.
+        let max_wait_ms: libc::c_int = 10;
         let n = sys::epoll_wait(self.epoll_fd, &mut self.events, max_wait_ms)?;
 
         for i in 0..n {
@@ -161,7 +165,8 @@ impl<H: EventHandler> Reactor<H> {
         // drain any frames/teardowns queued by tick() (or earlier by on_frame() handlers that were not drained inside handle_read)
         self.drain_handler_queues();
 
-        // idle timeout sweep (only on ticks that didn't process events, to keep the hot path fast; but we do it periodically by the 1s wait)
+        // idle timeout sweep (runs every tick; cheap and keeps teardowns timely).
+        // NOTE: idle marking is currently disabled — see sweep_timeouts().
         self.sweep_timeouts();
 
         Ok(())
@@ -183,6 +188,11 @@ impl<H: EventHandler> Reactor<H> {
         loop {
             match sys::accept(lfd) {
                 Ok((fd, addr)) => {
+                    // disable Nagle: message frames are small and lateness-sensitive.
+                    // Best-effort: a failure here doesn't make the socket unusable.
+                    if let Err(e) = sys::set_tcp_nodelay(fd) {
+                        eprintln!("warn: TCP_NODELAY failed on accepted fd {fd}: {e}");
+                    }
                     let id = ConnectionId(self.next_id);
                     self.next_id += 1;
                     let peer = SocketAddrV4::new(
@@ -374,19 +384,30 @@ impl<H: EventHandler> Reactor<H> {
     fn sweep_timeouts(&mut self) {
         let now = sys::now_ms();
 
-        // 1 mark idle connections for teardown
-        let mut expired: Vec<ConnectionId> = Vec::new();
-        for (&id, conn) in &self.connections {
-            if conn.teardown.is_none() && conn.idle_deadline <= now {
-                expired.push(id);
+        // 1 mark idle connections for teardown.
+        //
+        // The idle timeout is currently DISABLED: a chat client sends only on
+        // user input, so it is legitimately silent for long stretches. Killing
+        // it after 60s of inactivity breaks long-lived sessions. Keep the
+        // teardown-completion pass below (genuine EOFs and explicit Goodbyes
+        // still get reaped). To re-enable idle pruning, set this to true and
+        // make sure the client auto-pings well within DEFAULT_IDLE_TIMEOUT.
+        const ENFORCE_IDLE_TIMEOUT: bool = false;
+
+        if ENFORCE_IDLE_TIMEOUT {
+            let mut expired: Vec<ConnectionId> = Vec::new();
+            for (&id, conn) in &self.connections {
+                if conn.teardown.is_none() && conn.idle_deadline <= now {
+                    expired.push(id);
+                }
             }
-        }
-        for &id in &expired {
-            if let Some(conn) = self.connections.get_mut(&id) {
-                conn.start_teardown(TeardownReason::IdleTimeout);
-                let events =
-                    (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
-                let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, id.into());
+            for &id in &expired {
+                if let Some(conn) = self.connections.get_mut(&id) {
+                    conn.start_teardown(TeardownReason::IdleTimeout);
+                    let events =
+                        (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
+                    let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, id.into());
+                }
             }
         }
 
