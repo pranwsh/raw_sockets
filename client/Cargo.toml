@@ -1,0 +1,10 @@
+[package]
+name = "msgclient"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Channel-based client for the messaging service — send Actions, receive Events."
+
+[dependencies]
+protocol = { path = "../protocol" }
+hex = "0.4"
