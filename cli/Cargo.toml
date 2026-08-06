@@ -10,6 +10,8 @@ transport = { path = "../transport" }
 domain = { path = "../domain" }
 storage = { path = "../storage" }
 routing = { path = "../routing" }
+msgclient = { path = "../client" }
+msgtui = { git = "file:///home/pranesh/Code/tui", tag = "v0.1.0" }
 libc.workspace = true
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
