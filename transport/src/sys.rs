@@ -66,6 +66,31 @@ pub fn set_reuseaddr(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// disable Nagle's algorithm (TCP_NODELAY) on an accepted connection.
+///
+/// Messaging frames are small; without NODELAY the kernel may coalesce them
+/// into fewer packets and wait on a delayed ACK (~40ms) before flushing, which
+/// is noticeable latency on top of the store round-trips. NODELAY makes small
+/// frames leave immediately.
+pub fn set_tcp_nodelay(fd: RawFd) -> io::Result<()> {
+    let optval: c_int = 1;
+    let rc = unsafe {
+        // SAFETY: setsockopt for IPPROTO_TCP/TCP_NODELAY writes an int-sized
+        // option; safe with a valid fd and a valid pointer to optval.
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            &optval as *const _ as *const c_void,
+            std::mem::size_of_val(&optval) as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// bind to a local sockaddr_in returns io::Error on failure
 pub fn bind_v4(fd: RawFd, addr: &libc::sockaddr_in) -> io::Result<()> {
     let rc = unsafe {
