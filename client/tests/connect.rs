@@ -1,4 +1,4 @@
-//! End-to-end test: spins up the real msgcli server binary and drives it
+//! End-to-end test: spins up the real msgd server binary and drives it
 //! through the channel-based client API.
 
 use msgclient::{Action, Event, Client};
@@ -14,7 +14,7 @@ fn server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../target")
         .join(profile)
-        .join("msgcli")
+        .join("msgd")
 }
 
 fn free_port() -> u16 {
@@ -40,7 +40,6 @@ fn start_server() -> Server {
     let _ = std::fs::remove_file(&data);
     let child = Command::new(server_bin())
         .args([
-            "serve",
             "--bind",
             &format!("127.0.0.1:{port}"),
             "--data",
@@ -49,7 +48,7 @@ fn start_server() -> Server {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .expect("spawn msgcli server");
+        .expect("spawn msgd server");
     Server { child, port }
 }
 

@@ -481,15 +481,9 @@ name = "msgcli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "domain",
  "hex",
- "libc",
  "msgclient",
  "msgtui",
- "protocol",
- "routing",
- "storage",
- "transport",
 ]
 
 [[package]]
@@ -503,7 +497,6 @@ dependencies = [
 [[package]]
 name = "msgtui"
 version = "0.1.0"
-source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#25eb3c744b3cd52a67b5412b182d95d6eaa8f9a9"
 dependencies = [
  "hex",
  "term_render",
@@ -736,7 +729,6 @@ dependencies = [
  "domain",
  "libc",
  "protocol",
- "routing",
  "storage",
  "transport",
 ]
@@ -826,7 +818,6 @@ dependencies = [
 [[package]]
 name = "term_render"
 version = "0.1.3"
-source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#25eb3c744b3cd52a67b5412b182d95d6eaa8f9a9"
 dependencies = [
  "crossbeam",
  "crossterm",
@@ -839,7 +830,6 @@ dependencies = [
 [[package]]
 name = "term_render_macros"
 version = "0.1.0"
-source = "git+file:///home/pranesh/Code/tui?tag=v0.1.0#25eb3c744b3cd52a67b5412b182d95d6eaa8f9a9"
 dependencies = [
  "quote",
  "syn 2.0.119",

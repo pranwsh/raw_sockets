@@ -9,6 +9,7 @@ members = [
     "server",
     "cli",
     "client",
+    "tui",
 ]
 
 [workspace.package]

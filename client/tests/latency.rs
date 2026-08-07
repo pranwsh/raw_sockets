@@ -15,7 +15,7 @@ fn server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../target")
         .join(profile)
-        .join("msgcli")
+        .join("msgd")
 }
 
 fn free_port() -> u16 {
@@ -30,9 +30,9 @@ fn start_server() -> Server {
     let data = std::env::temp_dir().join(format!("msgclient_lat_{}.redb", std::process::id()));
     let _ = std::fs::remove_file(&data);
     let child = Command::new(server_bin())
-        .args(["serve", "--bind", &format!("127.0.0.1:{port}"), "--data", data.to_str().unwrap()])
+        .args(["--bind", &format!("127.0.0.1:{port}"), "--data", data.to_str().unwrap()])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn().expect("spawn msgcli");
+        .spawn().expect("spawn msgd");
     Server { child, port }
 }
 

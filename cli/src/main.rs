@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
-mod serve;
 mod send;
 mod shell;
 mod tui_client;
@@ -15,13 +14,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// start the messaging server
-    Serve {
-        #[arg(long, default_value = "0.0.0.0:9723")]
-        bind: String,
-        #[arg(long, default_value = "/tmp/msgd.redb")]
-        data: String,
-    },
     /// interactive TUI chat client (term_render frontend)
     Shell {
         #[arg(long, default_value = "127.0.0.1")]
@@ -59,10 +51,6 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve { bind, data } => {
-            serve::run(&bind, &data);
-            ExitCode::SUCCESS
-        }
         Command::Shell { host, port, user, password, conv } => {
             shell::run(&host, port, &user, &password, conv.as_deref())
         }
@@ -71,8 +59,7 @@ fn main() -> ExitCode {
                 eprintln!("error: either --conv or --create is required");
                 return ExitCode::from(1);
             }
-            send::run(&host, port, &user, &password, conv.as_deref(), create.as_deref(), &message, listen);
-            ExitCode::SUCCESS
+            send::run(&host, port, &user, &password, conv.as_deref(), create.as_deref(), &message, listen)
         }
     }
 }

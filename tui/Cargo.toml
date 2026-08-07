@@ -1,0 +1,17 @@
+[package]
+name = "msgtui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "reusable term_render-based chat TUI frontend (generic over a ChatClient trait)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# term_render 0.1.3 on crates.io doesn't compile unmodified (its
+# term_render_macros proc-macro lacks syn's "full" feature), so we vendor both
+# crates under vendor/ and depend on them by path.
+term_render = { path = "vendor/term_render" }
+hex = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
