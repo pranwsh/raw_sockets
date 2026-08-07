@@ -74,13 +74,15 @@ delivered seq=1
 ### `msgd` — the server
 
 ```
-Usage: msgd --bind ADDR --data PATH
+Usage: msgd [--bind ADDR] [--data PATH] [--fast|--durable]
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--bind` | `0.0.0.0:9723` | Listen address (IPv4). Uses `SO_REUSEPORT`. |
 | `--data` | `/tmp/msgd.redb` | Path to the `redb` store file. |
+| `--fast` | yes (default) | Skip the per-write `fsync` (`Durability::Eventual`) — lowest latency. |
+| `--durable` | no | `fsync` every write (`Durability::Immediate`) — sequence numbers survive a crash. |
 | `--help` / `-h` | — | Show usage and exit. |
 
 The server logs to stderr. Shut down with SIGINT/SIGTERM.

@@ -63,6 +63,11 @@ pub struct Domain {
     sessions: HashMap<ConnectionId, Session>,
     user_connections: HashMap<Vec<u8>, Vec<ConnectionId>>,
     user_conversations: HashMap<Vec<u8>, HashSet<Vec<u8>>>,
+    /// in-memory conversation membership, kept in sync with the store on
+    /// create/invite. Lets a Send skip the async conversation lookup store hop
+    /// entirely (falling back to the store when a conv isn't cached yet, e.g.
+    /// right after a server restart).
+    conversations: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     /// frames queued for the reactor to send
     pub outbound: Vec<(ConnectionId, Box<[u8]>)>,
     /// teardown requests queued for the reactor
@@ -78,6 +83,7 @@ impl Domain {
             sessions: HashMap::new(),
             user_connections: HashMap::new(),
             user_conversations: HashMap::new(),
+            conversations: HashMap::new(),
             outbound: Vec::new(),
             teardowns: Vec::new(),
             pending_ops: Vec::new(),
@@ -265,6 +271,27 @@ impl Domain {
         let msg_body = body[sep + 1..].to_vec();
         if msg_body.is_empty() {
             self.enqueue(id, MsgType::Error, b"empty_message");
+            return;
+        }
+        // Fast path: membership is cached in memory, so skip the async
+        // conversation lookup and go straight to the sequence write.
+        if let Some(members) = self.conversations.get(&conv_id) {
+            if !members.iter().any(|m| m == &session.user_id) {
+                self.enqueue(id, MsgType::Error, b"not_a_member");
+                return;
+            }
+            let rx = match self.store.next_sequence_async(&conv_id) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    self.enqueue(id, MsgType::Error, format!("seq: {e}").as_bytes());
+                    return;
+                }
+            };
+            self.pending_ops.push(PendingOp {
+                conn_id: id,
+                kind: PendingKind::SendSeqNext { session, conv_id, msg_body, members: members.clone() },
+                rx,
+            });
             return;
         }
         let rx = match self.store.get_conversation_async(&conv_id) {
@@ -485,10 +512,11 @@ impl Domain {
             // CreateConv store complete
             (PendingKind::CreateConvStore { conv_id, members_raw }, StoreResult::Stored(Ok(()))) => {
                 self.enqueue(conn_id, MsgType::ConvCreated, &conv_id);
-                for member in members_raw.split(|&b| b == b',') {
-                    if !member.is_empty() {
-                        self.user_conversations.entry(member.to_vec()).or_default().insert(conv_id.clone());
-                    }
+                let members: Vec<Vec<u8>> =
+                    members_raw.split(|&b| b == b',').filter(|m| !m.is_empty()).map(|m| m.to_vec()).collect();
+                self.conversations.insert(conv_id.clone(), members.clone());
+                for member in members {
+                    self.user_conversations.entry(member).or_default().insert(conv_id.clone());
                 }
             }
             (PendingKind::CreateConvStore { .. }, StoreResult::Stored(Err(e))) => {
@@ -529,7 +557,11 @@ impl Domain {
                         self.enqueue(target_id, MsgType::ConvMemberEvent, &updated_members);
                     }
                 }
-                self.user_conversations.entry(invitee).or_default().insert(conv_id);
+                self.user_conversations.entry(invitee).or_default().insert(conv_id.clone());
+                self.conversations
+                    .entry(conv_id)
+                    .or_default()
+                    .push(updated_members.rsplit(|&b| b == b',').next().unwrap_or_default().to_vec());
             }
             (PendingKind::ConvInviteStore { .. }, StoreResult::Stored(Err(e))) => {
                 self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());

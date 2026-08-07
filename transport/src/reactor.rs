@@ -45,6 +45,9 @@ pub struct Reactor<H: EventHandler> {
     epoll_fd: RawFd,
     /// listener socket fd for accepting new connections (none for routing)
     listener_fd: Option<RawFd>,
+    /// eventfd used by the store worker to wake the reactor when an async
+    /// result is ready (none when the reactor has no async source)
+    wake_fd: Option<RawFd>,
 
     connections: HashMap<ConnectionId, Connection>,
     handler: H,
@@ -71,9 +74,14 @@ pub struct Reactor<H: EventHandler> {
     pub total_connections: u64,
 }
 
+/// epoll u64 sentinel for the wake eventfd (no connection ID can equal this)
+const WAKE_SENTINEL: u64 = u64::MAX;
+
 impl<H: EventHandler> Reactor<H> {
-    /// create a new reactor
-    pub fn new(handler: H, listener_fd: Option<RawFd>) -> io::Result<Self> {
+    /// create a new reactor; `wake_fd` is an eventfd whose write end the store
+    /// worker pokes whenever an async result is ready, letting epoll_wait
+    /// return immediately instead of waiting out its timeout
+    pub fn new(handler: H, listener_fd: Option<RawFd>, wake_fd: Option<RawFd>) -> io::Result<Self> {
         let epoll_fd = sys::epoll_create()?;
 
         if let Some(lfd) = listener_fd {
@@ -81,10 +89,16 @@ impl<H: EventHandler> Reactor<H> {
             sys::epoll_add(epoll_fd, lfd, (libc::EPOLLIN | libc::EPOLLET) as u32, 0)?;
         }
 
+        if let Some(wfd) = wake_fd {
+            // edge-triggered so a drained counter stops reporting until the next poke
+            sys::epoll_add(epoll_fd, wfd, (libc::EPOLLIN | libc::EPOLLET) as u32, WAKE_SENTINEL)?;
+        }
+
         Ok(Self {
             next_id: 1,
             epoll_fd,
             listener_fd,
+            wake_fd,
             connections: HashMap::new(),
             handler,
             read_scratch: vec![0u8; 65536],
@@ -138,6 +152,13 @@ impl<H: EventHandler> Reactor<H> {
             if ptr == 0 {
                 // listener event
                 self.handle_accept()?;
+            } else if ptr == WAKE_SENTINEL {
+                // store worker poked us: an async result is ready. Drain the
+                // counter so the edge-triggered eventfd stops reporting; the
+                // handler.tick() below picks up the result immediately.
+                if let Some(wfd) = self.wake_fd {
+                    sys::drain_eventfd(wfd);
+                }
             } else {
                 let id = ConnectionId(ptr);
                 let is_hup = (ev.events & libc::EPOLLHUP as u32) != 0

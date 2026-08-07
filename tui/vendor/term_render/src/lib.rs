@@ -228,8 +228,10 @@ impl<C> App<C> {
                                                          terminal_size_change: SendSync<bool>
     ) -> Result<(), AppErr> {
         loop {
-            // quick sleep to keep the events up-to-date enough
-            tokio::time::sleep(tokio::time::Duration::from_secs_f64(0.01)).await;
+            // quick sleep to keep the events up-to-date enough. 2ms bounds
+            // inbound-message display latency (~500Hz) while the dirty-gate in
+            // render() keeps an idle screen doing zero draw work.
+            tokio::time::sleep(tokio::time::Duration::from_secs_f64(0.002)).await;
             let result = update_call_back(&mut data, self);
             match result {
                 Ok(should_exit) => {

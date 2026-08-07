@@ -52,7 +52,7 @@ fn wait_for(client: &Client, pred: impl Fn(&Event) -> bool) -> Event {
     loop {
         if let Some(ev) = client.events().try_iter().find(&pred) { return ev; }
         if Instant::now() >= deadline { panic!("timed out waiting for event"); }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 

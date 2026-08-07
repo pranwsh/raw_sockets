@@ -4,7 +4,10 @@
 
 use redb::{Database, ReadableTable, TableDefinition};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+
+pub use redb::Durability;
 
 // table definitions
 
@@ -61,17 +64,24 @@ impl std::error::Error for StoreError {}
 
 // store handle
 
+/// wake callback: invoked by the worker after each op so the reactor's epoll
+/// loop can return immediately and drain the result instead of waiting out its
+/// poll timeout
+pub type Notify = Option<Arc<dyn Fn() + Send + Sync>>;
+
 #[derive(Clone)]
 pub struct Store {
     tx: Sender<Op>,
 }
 
 impl Store {
-    /// open (or create) the database at path and spawn the background worker thread
-    pub fn open(path: &str) -> Result<Self, StoreError> {
+    /// open (or create) the database at path and spawn the background worker thread.
+    /// `notify` wakes the reactor when a result is ready; `durable` selects the
+    /// write-commit durability (Eventual skips the per-commit fsync).
+    pub fn open(path: &str, notify: Notify, durable: Durability) -> Result<Self, StoreError> {
         let db = Database::create(path).map_err(|e| StoreError::Redb(e.to_string()))?;
         let (tx, rx) = mpsc::channel::<Op>();
-        let _handle = spawn_worker(db, rx);
+        let _handle = spawn_worker(db, rx, notify, durable);
         Ok(Self { tx })
     }
 
@@ -206,12 +216,13 @@ impl Store {
 
 // worker thread
 
-fn spawn_worker(db: Database, rx: Receiver<Op>) -> JoinHandle<()> {
+fn spawn_worker(db: Database, rx: Receiver<Op>, notify: Notify, durable: Durability) -> JoinHandle<()> {
     thread::Builder::new()
         .name("store-worker".into())
         .spawn(move || {
             // ensure all tables exist (write transaction auto-creates)
-            if let Ok(txn) = db.begin_write() {
+            if let Ok(mut txn) = db.begin_write() {
+                txn.set_durability(durable);
                 let _ = txn.open_table(TABLE_ACCOUNTS);
                 let _ = txn.open_table(TABLE_CONVERSATIONS);
                 let _ = txn.open_table(TABLE_INBOX);
@@ -221,17 +232,20 @@ fn spawn_worker(db: Database, rx: Receiver<Op>) -> JoinHandle<()> {
             } else {
                 eprintln!("store: failed to initialize tables");
             }
-            worker_loop(db, rx)
+            worker_loop(db, rx, notify, durable)
         })
         .expect("spawn store worker")
 }
 
-fn worker_loop(db: Database, rx: Receiver<Op>) {
+fn worker_loop(db: Database, rx: Receiver<Op>, notify: Notify, durable: Durability) {
     loop {
         match rx.recv() {
             Ok(op) => {
-                if !process_op(&db, op) {
+                if !process_op(&db, op, durable) {
                     return;
+                }
+                if let Some(f) = &notify {
+                    f();
                 }
             }
             Err(_) => return,
@@ -243,13 +257,14 @@ fn db_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Redb(e.to_string())
 }
 
-fn process_op(db: &Database, op: Op) -> bool {
+fn process_op(db: &Database, op: Op, durable: Durability) -> bool {
     match op {
         Op::Shutdown => return false,
 
         Op::PutAccount { user_id, data, tx } => {
             let result = (|| -> Result<(), StoreError> {
-                let txn = db.begin_write().map_err(db_err)?;
+                let mut txn = db.begin_write().map_err(db_err)?;
+                txn.set_durability(durable);
                 {
                     let mut table = txn.open_table(TABLE_ACCOUNTS).map_err(db_err)?;
                     table.insert(user_id.as_slice(), data.as_slice()).map_err(db_err)?;
@@ -272,7 +287,8 @@ fn process_op(db: &Database, op: Op) -> bool {
 
         Op::PutConversation { conv_id, data, tx } => {
             let result = (|| -> Result<(), StoreError> {
-                let txn = db.begin_write().map_err(db_err)?;
+                let mut txn = db.begin_write().map_err(db_err)?;
+                txn.set_durability(durable);
                 {
                     let mut table = txn.open_table(TABLE_CONVERSATIONS).map_err(db_err)?;
                     table.insert(conv_id.as_slice(), data.as_slice()).map_err(db_err)?;
@@ -295,7 +311,8 @@ fn process_op(db: &Database, op: Op) -> bool {
 
         Op::NextSequence { conv_id, tx } => {
             let result = (|| -> Result<u64, StoreError> {
-                let txn = db.begin_write().map_err(db_err)?;
+                let mut txn = db.begin_write().map_err(db_err)?;
+                txn.set_durability(durable);
                 let next = {
                     let mut table = txn.open_table(TABLE_SEQUENCE).map_err(db_err)?;
                     let key = conv_id.as_slice();
@@ -323,7 +340,8 @@ fn process_op(db: &Database, op: Op) -> bool {
 
         Op::PutInbox { key, data, tx } => {
             let result = (|| -> Result<(), StoreError> {
-                let txn = db.begin_write().map_err(db_err)?;
+                let mut txn = db.begin_write().map_err(db_err)?;
+                txn.set_durability(durable);
                 {
                     let mut table = txn.open_table(TABLE_INBOX).map_err(db_err)?;
                     table.insert(key.as_slice(), data.as_slice()).map_err(db_err)?;
@@ -351,7 +369,8 @@ fn process_op(db: &Database, op: Op) -> bool {
 
         Op::DeleteInbox { key, tx } => {
             let result = (|| -> Result<(), StoreError> {
-                let txn = db.begin_write().map_err(db_err)?;
+                let mut txn = db.begin_write().map_err(db_err)?;
+                txn.set_durability(durable);
                 {
                     let mut table = txn.open_table(TABLE_INBOX).map_err(db_err)?;
                     table.remove(key.as_slice()).map_err(db_err)?;

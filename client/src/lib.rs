@@ -74,13 +74,17 @@ impl Client {
     pub fn connect(host: &str, port: u16) -> io::Result<Client> {
         let addr = format!("{}:{}", host, port);
         let stream = TcpStream::connect(&addr)?;
+        // Disable Nagle: message frames are small and lateness-sensitive, and
+        // an unacknowledged in-flight write would otherwise hold up the next
+        // frame for up to ~40ms (delayed-ACK).
+        stream.set_nodelay(true)?;
         // The background loop does a blocking read and can only drain the
         // action channel (and notice disconnects) when that read returns. A
         // short timeout keeps actions flowing promptly: with 100ms, a queued
         // Send could sit in the channel for ~100ms before being written to the
-        // socket, adding noticeable end-to-end latency. 10ms keeps pickup near
-        // real-time at negligible CPU cost.
-        stream.set_read_timeout(Some(Duration::from_millis(10)))?;
+        // socket, adding noticeable end-to-end latency. 1ms keeps pickup
+        // bounded to ~1ms at negligible CPU cost.
+        stream.set_read_timeout(Some(Duration::from_millis(1)))?;
 
         let (action_tx, action_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();

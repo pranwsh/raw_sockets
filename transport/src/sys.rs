@@ -244,8 +244,7 @@ pub fn epoll_del(epfd: RawFd, fd: RawFd) -> io::Result<()> {
 }
 
 /// blocking wait for events
-pub fn epoll_wait(epfd: RawFd, events: &mut [libc::epoll_event], timeout_ms: c_int) -> io::Result<usize> {
-    loop {
+pub fn epoll_wait(epfd: RawFd, events: &mut [libc::epoll_event], timeout_ms: c_int) -> io::Result<usize> {    loop {
         let n = unsafe {
             // SAFETY: events is a mutable slice; epoll_wait will write at most events.len() events into it
             libc::epoll_wait(epfd, events.as_mut_ptr(), events.len() as c_int, timeout_ms)
@@ -259,6 +258,48 @@ pub fn epoll_wait(epfd: RawFd, events: &mut [libc::epoll_event], timeout_ms: c_i
         }
         return Ok(n as usize);
     }
+}
+
+// eventfd wakeup — lets the store worker nudge the reactor's epoll loop so
+// async results are observed immediately instead of after the epoll_wait
+// timeout. The single fd is both the readable side (registered with epoll) and
+// the writable side (poked by the worker).
+
+/// create a non-blocking eventfd used to wake the reactor out of epoll_wait
+pub fn create_eventfd() -> io::Result<RawFd> {
+    let fd = unsafe {
+        // SAFETY: eventfd is safe; the kernel allocates a counter and returns a new fd handle
+        libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// increment the eventfd counter to wake the reactor (best-effort)
+pub fn wake_eventfd(fd: RawFd) {
+    let val: u64 = 1;
+    let rc = unsafe {
+        // SAFETY: write of a u64 counter value to a valid eventfd; best-effort, ignores EAGAIN
+        libc::write(fd, &val as *const u64 as *const c_void, std::mem::size_of_val(&val) as size_t)
+    };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) {
+            // counter is full (only possible if the reactor never drains) or
+            // interrupted — both safe to ignore
+        }
+    }
+}
+
+/// drain the eventfd counter so epoll stops reporting it as readable
+pub fn drain_eventfd(fd: RawFd) {
+    let mut buf = [0u8; 8];
+    let _ = unsafe {
+        // SAFETY: read of the 8-byte counter value into buf; safe on a valid eventfd
+        libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len() as size_t)
+    };
 }
 
 // time helpers
