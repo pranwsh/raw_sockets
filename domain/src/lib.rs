@@ -22,9 +22,9 @@ pub const CRED_LEN: usize = SALT_LEN + HASH_LEN;
 // session
 
 #[derive(Debug, Clone)]
-pub struct Session {
-    pub user_id: Vec<u8>,
-    pub authenticated: bool,
+struct Session {
+    user_id: Vec<u8>,
+    authenticated: bool,
 }
 
 // inbox helpers
@@ -45,9 +45,7 @@ enum PendingKind {
     SendConvLookup { session: Session, conv_id: Vec<u8>, msg_body: Vec<u8> },
     SendSeqNext { session: Session, conv_id: Vec<u8>, msg_body: Vec<u8>, members: Vec<Vec<u8>> },
     CreateConvStore { conv_id: Vec<u8>, members_raw: Vec<u8> },
-    ConvInviteLookup { conv_id: Vec<u8>, invitee: Vec<u8> },
-    ConvInviteStore { conv_id: Vec<u8>, invitee: Vec<u8>, updated_members: Vec<u8> },
-    InboxFetch { user_id: Vec<u8>, prefix: Vec<u8>, send_resp: bool },
+    InboxFetch,
 }
 
 struct PendingOp {
@@ -69,9 +67,9 @@ pub struct Domain {
     /// right after a server restart).
     conversations: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     /// frames queued for the reactor to send
-    pub outbound: Vec<(ConnectionId, Box<[u8]>)>,
+    outbound: Vec<(ConnectionId, Box<[u8]>)>,
     /// teardown requests queued for the reactor
-    pub teardowns: Vec<(ConnectionId, TeardownReason)>,
+    teardowns: Vec<(ConnectionId, TeardownReason)>,
     /// in-flight async storage operations
     pending_ops: Vec<PendingOp>,
 }
@@ -126,12 +124,10 @@ impl Domain {
     }
 
     fn handle_hello(&mut self, id: ConnectionId, body: &[u8]) {
-        let Some(sep) = body.iter().position(|&b| b == b'\n') else {
+        let Some((user_id, password)) = protocol::split_hello(body) else {
             self.enqueue(id, MsgType::AuthFail, b"bad_hello_format");
             return;
         };
-        let user_id = &body[..sep];
-        let password = &body[sep + 1..];
         if user_id.is_empty() || user_id.len() > USER_ID_MAX_LEN {
             self.enqueue(id, MsgType::AuthFail, b"invalid_user_id");
             return;
@@ -175,7 +171,16 @@ impl Domain {
         if !conns.contains(&id) {
             conns.push(id);
         }
-        let prefix = inbox_prefix_user(&user_id);
+        self.start_inbox_fetch(id);
+    }
+
+    /// queue a fetch of this user's stored inbox; delivered automatically after auth
+    fn start_inbox_fetch(&mut self, id: ConnectionId) {
+        let session = match self.authenticated(id) {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let prefix = inbox_prefix_user(&session.user_id);
         let rx = match self.store.get_inbox_range_async(&prefix, 100) {
             Ok(rx) => rx,
             Err(e) => {
@@ -183,11 +188,7 @@ impl Domain {
                 return;
             }
         };
-        self.pending_ops.push(PendingOp {
-            conn_id: id,
-            kind: PendingKind::InboxFetch { user_id, prefix, send_resp: false },
-            rx,
-        });
+        self.pending_ops.push(PendingOp { conn_id: id, kind: PendingKind::InboxFetch, rx });
     }
 
     fn authenticated(&self, id: ConnectionId) -> Option<&Session> {
@@ -232,30 +233,6 @@ impl Domain {
         });
     }
 
-    fn handle_conv_invite(&mut self, id: ConnectionId, body: &[u8]) {
-        if self.authenticated(id).is_none() {
-            return;
-        }
-        let sep = body.iter().position(|&b| b == b'\n').unwrap_or(body.len());
-        let conv_id = &body[..sep];
-        let invitee = if sep < body.len() { &body[sep + 1..] } else { return };
-        if invitee.is_empty() {
-            return;
-        }
-        let rx = match self.store.get_conversation_async(conv_id) {
-            Ok(rx) => rx,
-            Err(e) => {
-                self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
-                return;
-            }
-        };
-        self.pending_ops.push(PendingOp {
-            conn_id: id,
-            kind: PendingKind::ConvInviteLookup { conv_id: conv_id.to_vec(), invitee: invitee.to_vec() },
-            rx,
-        });
-    }
-
     // messaging
 
     fn handle_send(&mut self, id: ConnectionId, body: &[u8]) {
@@ -263,12 +240,12 @@ impl Domain {
             Some(s) => s.clone(),
             None => return,
         };
-        let Some(sep) = body.iter().position(|&b| b == b'\n') else {
+        let Some((conv_id, text)) = protocol::split_send(body) else {
             self.enqueue(id, MsgType::Error, b"bad_send_format");
             return;
         };
-        let conv_id = body[..sep].to_vec();
-        let msg_body = body[sep + 1..].to_vec();
+        let conv_id = conv_id.to_vec();
+        let msg_body = text.to_vec();
         if msg_body.is_empty() {
             self.enqueue(id, MsgType::Error, b"empty_message");
             return;
@@ -276,7 +253,7 @@ impl Domain {
         // Fast path: membership is cached in memory, so skip the async
         // conversation lookup and go straight to the sequence write.
         if let Some(members) = self.conversations.get(&conv_id) {
-            if !members.iter().any(|m| m == &session.user_id) {
+            if !Self::is_member(members, &session.user_id) {
                 self.enqueue(id, MsgType::Error, b"not_a_member");
                 return;
             }
@@ -308,20 +285,18 @@ impl Domain {
         });
     }
 
-    fn deliver_to_connection(&mut self, id: ConnectionId, _user_id: &[u8], conv_id: &[u8], seq: u64, msg_data: &[u8]) {
-        let body_len = conv_id.len() + 1 + 8 + msg_data.len();
+    /// deliver a pre-built delivery `Send` body to one connection
+    fn deliver_to_connection(&mut self, id: ConnectionId, body: &[u8]) {
+        let body_len = body.len();
         let total = protocol::HEADER_LEN + body_len + protocol::TRAILER_LEN;
         let mut buf = vec![0u8; total].into_boxed_slice();
-        let mut pos = protocol::HEADER_LEN;
-        buf[pos..pos + conv_id.len()].copy_from_slice(conv_id);
-        pos += conv_id.len();
-        buf[pos] = b'\n';
-        pos += 1;
-        buf[pos..pos + 8].copy_from_slice(&seq.to_le_bytes());
-        pos += 8;
-        buf[pos..pos + msg_data.len()].copy_from_slice(msg_data);
+        buf[protocol::HEADER_LEN..protocol::HEADER_LEN + body_len].copy_from_slice(body);
         protocol::seal(&mut buf, MsgType::Send, 0, body_len);
         self.outbound.push((id, buf));
+    }
+
+    fn is_member(members: &[Vec<u8>], user: &[u8]) -> bool {
+        members.iter().any(|m| m.as_slice() == user)
     }
 
     fn handle_list_convs(&mut self, id: ConnectionId) {
@@ -337,36 +312,21 @@ impl Domain {
         self.enqueue(id, MsgType::ConvsResp, &body);
     }
 
-    fn handle_inbox_fetch(&mut self, id: ConnectionId) {
-        let session = match self.authenticated(id) {
-            Some(s) => s.clone(),
-            None => return,
-        };
-        let prefix = inbox_prefix_user(&session.user_id);
-        let rx = match self.store.get_inbox_range_async(&prefix, 100) {
-            Ok(rx) => rx,
-            Err(e) => {
-                self.enqueue(id, MsgType::Error, format!("inbox: {e}").as_bytes());
-                return;
-            }
-        };
-        self.pending_ops.push(PendingOp {
-            conn_id: id,
-            kind: PendingKind::InboxFetch { user_id: session.user_id, prefix, send_resp: true },
-            rx,
-        });
+    fn handle_goodbye(&mut self, id: ConnectionId) {
+        self.remove_session(id);
+        self.teardowns.push((id, TeardownReason::ClientGoodbye));
     }
 
-    fn handle_goodbye(&mut self, id: ConnectionId) {
-        if let Some(session) = self.sessions.remove(&id) {
-            if let Some(conns) = self.user_connections.get_mut(&session.user_id) {
-                conns.retain(|&c| c != id);
-                if conns.is_empty() {
-                    self.user_connections.remove(&session.user_id);
-                }
+    /// drop the session for `id` and unregister it from the user's connection set
+    fn remove_session(&mut self, id: ConnectionId) {
+        if let Some(session) = self.sessions.remove(&id)
+            && let Some(conns) = self.user_connections.get_mut(&session.user_id)
+        {
+            conns.retain(|&c| c != id);
+            if conns.is_empty() {
+                self.user_connections.remove(&session.user_id);
             }
         }
-        self.teardowns.push((id, TeardownReason::ClientGoodbye));
     }
 
     // async result processing
@@ -449,7 +409,7 @@ impl Domain {
             // send: conversation lookup
             (PendingKind::SendConvLookup { session, conv_id, msg_body }, StoreResult::Conversation(Ok(Some(data)))) => {
                 let members: Vec<Vec<u8>> = data.split(|&b| b == b',').map(|m| m.to_vec()).collect();
-                if !members.iter().any(|m| m == &session.user_id) {
+                if !Self::is_member(&members, &session.user_id) {
                     self.enqueue(conn_id, MsgType::Error, b"not_a_member");
                     return;
                 }
@@ -475,20 +435,14 @@ impl Domain {
 
             // send: sequence obtained → deliver + ack
             (PendingKind::SendSeqNext { session, conv_id, msg_body, members }, StoreResult::Sequence(Ok(seq))) => {
-                let msg_data = {
-                    let mut d = Vec::new();
-                    d.extend_from_slice(&session.user_id);
-                    d.push(b'\n');
-                    d.extend_from_slice(&msg_body);
-                    d
-                };
+                let delivery = protocol::delivery_body(&conv_id, seq, &session.user_id, &msg_body);
                 for member in &members {
-                    if member != &session.user_id {
-                        if let Some(conns) = self.user_connections.get(member) {
-                            let targets: Vec<ConnectionId> = conns.clone();
-                            for target_id in targets {
-                                self.deliver_to_connection(target_id, &session.user_id, &conv_id, seq, &msg_data);
-                            }
+                    if member != &session.user_id
+                        && let Some(conns) = self.user_connections.get(member)
+                    {
+                        let targets: Vec<ConnectionId> = conns.clone();
+                        for target_id in targets {
+                            self.deliver_to_connection(target_id, &delivery);
                         }
                     }
                 }
@@ -499,11 +453,11 @@ impl Domain {
                         inbox_key.push(b'/');
                         inbox_key.extend_from_slice(&conv_id);
                         inbox_key.push(b'/');
-                        inbox_key.extend_from_slice(&seq.to_be_bytes());
-                        let _ = self.store.put_inbox_async(&inbox_key, &msg_data);
+                        inbox_key.extend_from_slice(&protocol::write_u64_le(seq));
+                        let _ = self.store.put_inbox_async(&inbox_key, &delivery);
                     }
                 }
-                self.enqueue(conn_id, MsgType::Delivered, &seq.to_le_bytes());
+                self.enqueue(conn_id, MsgType::Delivered, &protocol::write_u64_le(seq));
             }
             (PendingKind::SendSeqNext { .. }, StoreResult::Sequence(Err(e))) => {
                 self.enqueue(conn_id, MsgType::Error, format!("seq: {e}").as_bytes());
@@ -523,75 +477,14 @@ impl Domain {
                 self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
             }
 
-            // ConvInvite: conversation lookup
-            (PendingKind::ConvInviteLookup { conv_id, invitee }, StoreResult::Conversation(Ok(Some(data)))) => {
-                let mut members = data;
-                members.extend_from_slice(b",");
-                members.extend_from_slice(&invitee);
-                let rx = match self.store.put_conversation_async(&conv_id, &members) {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
-                        return;
-                    }
-                };
-                self.pending_ops.push(PendingOp {
-                    conn_id,
-                    kind: PendingKind::ConvInviteStore { conv_id, invitee, updated_members: members },
-                    rx,
-                });
-            }
-            (PendingKind::ConvInviteLookup { .. }, StoreResult::Conversation(Ok(None))) => {
-                self.enqueue(conn_id, MsgType::Error, b"conv_not_found");
-            }
-            (PendingKind::ConvInviteLookup { .. }, StoreResult::Conversation(Err(e))) => {
-                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
-            }
-
-            // ConvInvite: store complete → notify
-            (PendingKind::ConvInviteStore { conv_id, invitee, updated_members }, StoreResult::Stored(Ok(()))) => {
-                self.enqueue(conn_id, MsgType::ConvMemberEvent, &updated_members);
-                if let Some(conns) = self.user_connections.get(&invitee) {
-                    let targets: Vec<ConnectionId> = conns.clone();
-                    for target_id in targets {
-                        self.enqueue(target_id, MsgType::ConvMemberEvent, &updated_members);
-                    }
-                }
-                self.user_conversations.entry(invitee).or_default().insert(conv_id.clone());
-                self.conversations
-                    .entry(conv_id)
-                    .or_default()
-                    .push(updated_members.rsplit(|&b| b == b',').next().unwrap_or_default().to_vec());
-            }
-            (PendingKind::ConvInviteStore { .. }, StoreResult::Stored(Err(e))) => {
-                self.enqueue(conn_id, MsgType::Error, format!("storage: {e}").as_bytes());
-            }
-
-            // inbox fetch (auth or explicit)
-            (PendingKind::InboxFetch { user_id, prefix, send_resp }, StoreResult::InboxRange(Ok(items))) => {
+            // inbox flush after auth: deliver each stored delivery body, then delete it
+            (PendingKind::InboxFetch, StoreResult::InboxRange(Ok(items))) => {
                 for (key, data) in &items {
-                    if key.starts_with(&prefix) && key.len() > prefix.len() {
-                        let rest = &key[prefix.len()..];
-                        let parts: Vec<&[u8]> = rest.split(|&b| b == b'/').collect();
-                        if parts.len() >= 2 {
-                            let conv_id = parts[0];
-                            let seq = if parts[1].len() >= 8 {
-                                let mut arr = [0u8; 8];
-                                arr.copy_from_slice(&parts[1][..8]);
-                                u64::from_be_bytes(arr)
-                            } else {
-                                continue;
-                            };
-                            self.deliver_to_connection(conn_id, &user_id, conv_id, seq, data);
-                            let _ = self.store.delete_inbox_async(key);
-                        }
-                    }
-                }
-                if send_resp {
-                    self.enqueue(conn_id, MsgType::InboxResp, &[]);
+                    self.deliver_to_connection(conn_id, data);
+                    let _ = self.store.delete_inbox_async(key);
                 }
             }
-            (PendingKind::InboxFetch { .. }, StoreResult::InboxRange(Err(e))) => {
+            (PendingKind::InboxFetch, StoreResult::InboxRange(Err(e))) => {
                 self.enqueue(conn_id, MsgType::Error, format!("inbox: {e}").as_bytes());
             }
 
@@ -612,9 +505,7 @@ impl EventHandler for Domain {
             MsgType::Hello => self.handle_hello(id, &frame.body),
             MsgType::Goodbye => self.handle_goodbye(id),
             MsgType::CreateConv => self.handle_create_conv(id, &frame.body),
-            MsgType::ConvInvite => self.handle_conv_invite(id, &frame.body),
             MsgType::Send => self.handle_send(id, &frame.body),
-            MsgType::InboxFetch => self.handle_inbox_fetch(id),
             MsgType::ListConvs => self.handle_list_convs(id),
             MsgType::Ping => self.enqueue(id, MsgType::Pong, &[]),
             MsgType::Presence => self.enqueue(id, MsgType::Presence, &frame.body),
@@ -623,14 +514,7 @@ impl EventHandler for Domain {
     }
 
     fn on_teardown(&mut self, id: ConnectionId, _reason: TeardownReason) {
-        if let Some(session) = self.sessions.remove(&id) {
-            if let Some(conns) = self.user_connections.get_mut(&session.user_id) {
-                conns.retain(|&c| c != id);
-                if conns.is_empty() {
-                    self.user_connections.remove(&session.user_id);
-                }
-            }
-        }
+        self.remove_session(id);
     }
 
     fn tick(&mut self) {
