@@ -7,4 +7,4 @@ description = "Channel-based client for the messaging service — send Actions, 
 
 [dependencies]
 protocol = { path = "../protocol" }
-hex = "0.4"
+chat-model = { path = "../chat-model" }
