@@ -39,7 +39,6 @@ Every message on the wire is a **frame**:
 |-----|----------|---------|
 | 15 | `FLAG_COMPRESSED` | Body is zlib-compressed. |
 | 14 | `FLAG_ACK_REQ` | Sender requests an ack. |
-| 13 | `FLAG_PRIORITY` | Mark for priority delivery. |
 
 ## Connection Lifecycle
 
@@ -83,8 +82,8 @@ stored inbox messages as `Send` frames (same body format as client-originated
 ### 4. Teardown
 
 Either side may send `Goodbye` (empty body). The server also tears down on
-protocol violations, idle timeout, or backpressure cap — in those cases the
-peer receives a TCP RST or FIN without a `Goodbye`.
+protocol violations or backpressure cap — in those cases the peer receives a
+TCP RST or FIN without a `Goodbye`.
 
 ## Message Types
 
@@ -95,16 +94,6 @@ peer receives a TCP RST or FIN without a `Goodbye`.
 Initiates auth and carries the user-chosen password. For a new user the server
 creates the account (replying `AuthOk` with flag `1`); for an existing user it
 verifies the password (replying `AuthOk` with flag `0` or `AuthFail`).
-
-### `AuthChallenge` (2) — Server → Client
-
-Legacy / reserved. Not used by the current server; superseded by the
-single-message `Hello` handshake.
-
-### `AuthResponse` (3) — Client → Server
-
-Legacy / reserved. Not used by the current server; superseded by the
-single-message `Hello` handshake.
 
 ### `AuthOk` (4) — Server → Client
 
@@ -133,12 +122,6 @@ prepared for abrupt disconnection.
 Echoed to connected peers. Currently a pass-through — reserved for future
 online/offline notification.
 
-### `Typing` (11) — Client → Server
-
-**Body**: `<conv_id>`.
-
-Reserved. Not yet processed.
-
 ### `CreateConv` (20) — Client → Server
 
 **Body**: comma-separated member user IDs, e.g. `alice,bob`.
@@ -151,30 +134,6 @@ Creates a deterministic conversation ID (hash of sorted member list). Minimum
 **Body**: 8-byte conversation ID (little-endian u64 hash).
 
 Sent in response to `CreateConv`.
-
-### `ConvInvite` (22) — Client → Server
-
-**Body**: `<conv_id>\n<user_id>`.
-
-Adds a user to an existing conversation.
-
-### `ConvJoin` (23) — Client → Server
-
-**Body**: `conv_id`.
-
-Reserved for explicit join.
-
-### `ConvLeave` (24) — Client → Server
-
-**Body**: `conv_id`.
-
-Reserved for leaving a conversation.
-
-### `ConvMemberEvent` (25) — Server → Client
-
-**Body**: comma-separated member list.
-
-Sent after a successful `ConvInvite` to all participants.
 
 ### `Send` (30) — Client → Server / Server → Client
 
@@ -194,37 +153,6 @@ auth (either immediately for online delivery or on reconnect for offline).
 
 Acknowledges that a `Send` was persisted and will be delivered.
 
-### `Read` (32) — Client → Server
-
-**Body**: `<conv_id>\n<seq:8le>`.
-
-Reserved for read receipts.
-
-### `HistoryReq` (33) — Client → Server
-
-**Body**: `<conv_id>\n<since_seq:8le>\n<limit:4le>`.
-
-Reserved for fetching history.
-
-### `HistoryResp` (34) — Server → Client
-
-**Body**: TBD.
-
-Reserved.
-
-### `InboxFetch` (35) — Client → Server
-
-**Body**: empty.
-
-Requests any pending inbox messages. The server responds with queued `Send`
-frames followed by an `InboxResp`.
-
-### `InboxResp` (36) — Server → Client
-
-**Body**: empty.
-
-Sent after all pending inbox messages have been delivered.
-
 ### `ListConvs` (37) — Client → Server
 
 **Body**: empty.
@@ -239,30 +167,6 @@ conversation.
 
 Sent in response to `ListConvs`. An empty body means the user has no
 conversations.
-
-### `RouteAnnounce` (40) — Node → Node
-
-**Body**: comma-separated user IDs present on the announcing node.
-
-Part of the inter-node mesh protocol (`routing` crate). Broadcasts local user
-presence to peer nodes so they can build `user_id → node` routing tables.
-
-### `RouteDeliver` (41) — Node → Node
-
-**Body**: `<user_id>\n<message_data>`.
-
-Forwards a message to the peer node that owns the target user. The receiving
-node re-wraps `message_data` as a `Send` frame for local dispatch.
-
-### `NodeHello` (42) — Node → Node
-
-**Body**: implementation-defined (e.g. node ID).
-
-Opens the control connection between mesh peers.
-
-> **Note:** The routing types (40–42) are defined and the `Router` logic is
-> implemented in the `routing` crate, but the mesh is not yet wired into the
-> server binary.
 
 ### `Ping` (90) — Bidirectional
 
@@ -395,7 +299,6 @@ The server tears down a connection (no `Goodbye` sent) when it receives:
 - A bad magic byte or unsupported protocol version.
 - A frame with `body_len > 16 MiB`.
 - A CRC32C mismatch (wire corruption).
-- An idle connection (no frames for the configured timeout).
 
 Application-level errors (`Error` type 99) do **not** tear down — the
 connection remains usable.
@@ -411,6 +314,7 @@ connection remains usable.
   a key-derivation function with a work factor (bcrypt/argon2) and TLS for
   transport.
 - Legacy token-based handshake (`AuthChallenge`/`AuthResponse` + 32-byte
-  derived token) was replaced; those message types are reserved but unused.
+  derived token) was replaced; those message types have since been removed
+  from the protocol.
 - Accounts created before this change stored a 32-byte derived token instead
   of a credential, so they cannot authenticate under the new scheme.
