@@ -5,11 +5,10 @@ members = [
     "transport",
     "storage",
     "domain",
-    "routing",
     "server",
-    "cli",
     "client",
     "tui",
+    "chat-model",
 ]
 
 [workspace.package]
