@@ -1,13 +1,13 @@
 //! benchmarks: throughput and latency of the messaging server
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::io::{Read, Write};
 use std::net::{TcpStream, SocketAddr};
 use std::process::{Command, Child};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use protocol::{self, MsgType, Decode, OwnedFrame};
+use protocol::{self, MsgType, Decode};
 
 // helper: spawn a server instance
 
@@ -41,6 +41,13 @@ fn spawn_server() -> ServerProcess {
     ServerProcess { child, addr, _lock: lock }
 }
 
+impl Drop for ServerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn portpicker() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
@@ -66,7 +73,7 @@ fn auth_round_trip(addr: SocketAddr) -> Duration {
     let mut offset = 0;
     loop {
         match protocol::decode(&buf[..offset]) {
-            Decode::Complete { consumed, .. } => {
+            Decode::Complete { .. } => {
                 let elapsed = start.elapsed();
                 // consume the rest of the frame
                 return elapsed;
@@ -116,7 +123,7 @@ fn ping_round_trip(addr: SocketAddr) -> Duration {
 
     loop {
         match protocol::decode(&buf[..offset]) {
-            Decode::Complete { consumed, .. } => {
+            Decode::Complete { .. } => {
                 let elapsed = start.elapsed();
                 return elapsed;
             }
