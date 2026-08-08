@@ -1,9 +1,0 @@
-[package]
-name = "routing"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Inter-node routing — lightweight pub/sub between instances."
-
-[dependencies]
-protocol = { path = "../protocol" }
