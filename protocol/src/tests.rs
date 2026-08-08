@@ -125,7 +125,6 @@ fn rejects_body_too_large() {
     let mut buf = vec![0u8; HEADER_LEN];
     buf[0] = MAGIC;
     buf[1] = VERSION;
-    buf[2..4].copy_from_slice(&0u16.to_le_bytes()); // MsgType 0 survives until length check? No: UnknownMsgType first.
     // use a known-good type to reach the length check
     buf[2..4].copy_from_slice(&(MsgType::Send as u16).to_le_bytes());
     // declare MAX_BODY_LEN+1
