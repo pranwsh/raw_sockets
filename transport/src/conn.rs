@@ -6,7 +6,6 @@ use crate::sys;
 use protocol::{self, Decode, DecodeError, OwnedFrame};
 use std::io;
 use std::os::unix::io::RawFd;
-use std::time::Duration;
 
 // constants — these should be tuned by benchmark; values below are conservative starting points
 
@@ -14,13 +13,10 @@ use std::time::Duration;
 pub const WRITE_BUFFER_SOFT_LIMIT: usize = 256 * 1024;
 
 /// absolute cap: when outbound exceeds this, the connection is torn down with Reason::SlowClient must be ≥ WRITE_BUFFER_SOFT_LIMIT
-pub const WRITE_BUFFER_HARD_CAP: usize = 1 * 1024 * 1024;
+pub const WRITE_BUFFER_HARD_CAP: usize = 1024 * 1024;
 
 /// maximum size of the read buffer before we disconnect the client (anti-OOM)
-pub const READ_BUFFER_HARD_CAP: usize = 1 * 1024 * 1024;
-
-/// default idle timeout
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const READ_BUFFER_HARD_CAP: usize = 1024 * 1024;
 
 /// after a teardown is initiated, how long we keep the fd around to flush remaining outbound data before closing
 pub const DRAIN_TIMEOUT_MS: u64 = 3_000;
@@ -44,8 +40,6 @@ impl From<ConnectionId> for u64 {
 pub enum TeardownReason {
     /// peer sent a clean Goodbye frame
     ClientGoodbye,
-    /// idle timeout — no frames received within the deadline
-    IdleTimeout,
     /// unparseable frame — protocol mismatch or corruption
     ProtocolViolation,
     /// peer reset (RST) or closed without goodbye (EOF)
@@ -129,12 +123,7 @@ impl WriteBuffer {
 /// per-connection state
 #[derive(Debug)]
 pub struct Connection {
-    pub id: ConnectionId,
-    pub fd: RawFd,
-    /// peer address for logging / routing decisions
-    pub peer: std::net::SocketAddrV4,
-    /// monotonic-ms deadline for idle disconnect
-    pub idle_deadline: u64,
+    pub(crate) fd: RawFd,
 
     // read side
     read_buf: Vec<u8>,
@@ -144,13 +133,13 @@ pub struct Connection {
     // write side
     write_buf: WriteBuffer,
     /// true when we've asked the reactor to poll for EPOLLOUT (because we have pending data)
-    pub write_pending: bool,
+    pub(crate) write_pending: bool,
 
     /// if Some, the connection is in its teardown phase
-    pub teardown: Option<TeardownState>,
+    pub(crate) teardown: Option<TeardownState>,
 
     /// whether we should keep reading from this socket (soft backpressure)
-    pub read_paused: bool,
+    pub(crate) read_paused: bool,
 }
 
 /// a connection passes through a single teardown phase — flush remaining writes, then close
@@ -165,13 +154,9 @@ pub struct TeardownState {
 
 impl Connection {
     /// create a new connection
-    pub fn new(fd: RawFd, peer: std::net::SocketAddrV4, id: ConnectionId) -> Self {
-        let deadline = sys::deadline_after(DEFAULT_IDLE_TIMEOUT);
+    pub fn new(fd: RawFd) -> Self {
         Self {
-            id,
             fd,
-            peer,
-            idle_deadline: deadline,
             read_buf: Vec::with_capacity(8192),
             read_offset: 0,
             write_buf: WriteBuffer::new(),
@@ -179,11 +164,6 @@ impl Connection {
             teardown: None,
             read_paused: false,
         }
-    }
-
-    /// reset the idle timer (call after every successfully decoded frame)
-    pub fn touch_idle(&mut self) {
-        self.idle_deadline = sys::deadline_after(DEFAULT_IDLE_TIMEOUT);
     }
 
     // read path
@@ -221,7 +201,6 @@ impl Connection {
                 let owned = OwnedFrame::from_borrowed(&frame);
                 // frame and available borrows are dropped here
                 self.read_offset += consumed;
-                self.touch_idle();
                 Ok(Some(owned))
             }
             Decode::Need => Ok(None),
@@ -259,11 +238,6 @@ impl Connection {
     /// returns true if the write buffer is empty
     pub fn is_write_empty(&self) -> bool {
         self.write_buf.is_empty()
-    }
-
-    /// current write-buffer occupancy in bytes
-    pub fn write_buffered_bytes(&self) -> usize {
-        self.write_buf.len()
     }
 
     // backpressure: soft limit check
@@ -334,19 +308,13 @@ impl Connection {
 
 impl TeardownReason {
     fn farewell_frame(self) -> Box<[u8]> {
-        let body: &[u8] = match self {
-            TeardownReason::ClientGoodbye => b"goodbye",
-            TeardownReason::IdleTimeout => b"idle_timeout",
-            TeardownReason::ProtocolViolation => b"proto_error",
-            TeardownReason::PeerClosed => b"peer_closed",
-            TeardownReason::SlowClient => b"slow_client",
-            TeardownReason::Shutdown => b"shutdown",
-        };
-        let msg_type = match self {
-            TeardownReason::ClientGoodbye => protocol::MsgType::Goodbye,
-            _ => protocol::MsgType::Error,
-        };
-        protocol::encode(msg_type, 0, body)
+        match self {
+            TeardownReason::ClientGoodbye => protocol::encode(protocol::MsgType::Goodbye, 0, &[]),
+            TeardownReason::ProtocolViolation => protocol::encode(protocol::MsgType::Error, 0, b"proto_error"),
+            TeardownReason::PeerClosed => protocol::encode(protocol::MsgType::Error, 0, b"peer_closed"),
+            TeardownReason::SlowClient => protocol::encode(protocol::MsgType::Error, 0, b"slow_client"),
+            TeardownReason::Shutdown => protocol::encode(protocol::MsgType::Error, 0, b"shutdown"),
+        }
     }
 }
 
