@@ -6,5 +6,5 @@ pub mod conn;
 pub mod reactor;
 pub mod sys;
 
-pub use conn::{Connection, ConnectionId, TeardownReason, WriteOutcome};
+pub use conn::{ConnectionId, TeardownReason};
 pub use reactor::{EventHandler, Reactor};
