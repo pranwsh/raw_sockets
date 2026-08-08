@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 use term_render::widget_impls::{WidgetBuilder};
 use term_render::{self, event_handler::KeyCode};
 use term_render::render::{Colorize, ColorType};
