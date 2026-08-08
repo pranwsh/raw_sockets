@@ -14,18 +14,18 @@ pub use redb::Durability;
 static TABLE_ACCOUNTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("accounts_v1");
 static TABLE_CONVERSATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("conversations_v1");
 static TABLE_INBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_v1");
-#[allow(dead_code)]
-static TABLE_MESSAGE_LOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("message_log_v1");
 static TABLE_SEQUENCE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("sequence_v1");
 
 // StoreResult — type-erased response so every async method returns the same
+
+pub type InboxItem = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug)]
 pub enum StoreResult {
     Account(Result<Option<Vec<u8>>, StoreError>),
     Conversation(Result<Option<Vec<u8>>, StoreError>),
     Sequence(Result<u64, StoreError>),
-    InboxRange(Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError>),
+    InboxRange(Result<Vec<InboxItem>, StoreError>),
     Stored(Result<(), StoreError>),
 }
 
@@ -40,7 +40,6 @@ enum Op {
     PutInbox { key: Vec<u8>, data: Vec<u8>, tx: Sender<StoreResult> },
     GetInboxRange { prefix: Vec<u8>, limit: u32, tx: Sender<StoreResult> },
     DeleteInbox { key: Vec<u8>, tx: Sender<StoreResult> },
-    Shutdown,
 }
 
 // StoreError
@@ -138,80 +137,6 @@ impl Store {
         self.send(Op::DeleteInbox { key: key.to_vec(), tx })?;
         Ok(rx)
     }
-
-    // blocking API — convenience for tests and CLI
-
-    fn recv_blocking(rx: Receiver<StoreResult>) -> Result<StoreResult, StoreError> {
-        rx.recv().map_err(|_| StoreError::Channel)
-    }
-
-    pub fn put_account(&self, user_id: &[u8], data: &[u8]) -> Result<(), StoreError> {
-        let rx = self.put_account_async(user_id, data)?;
-        match Self::recv_blocking(rx)? {
-            StoreResult::Stored(r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn get_account(&self, user_id: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let rx = self.get_account_async(user_id)?;
-        match Self::recv_blocking(rx)? {
-            StoreResult::Account(r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn put_conversation(&self, conv_id: &[u8], data: &[u8]) -> Result<(), StoreError> {
-        let rx = self.put_conversation_async(conv_id, data)?;
-        match Self::recv_blocking(rx)? {
-            StoreResult::Stored(r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn get_conversation(&self, conv_id: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        let rx = self.get_conversation_async(conv_id)?;
-        match Self::recv_blocking(rx)? {
-            StoreResult::Conversation(r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn next_sequence(&self, conv_id: &[u8]) -> Result<u64, StoreError> {
-        let rx = self.next_sequence_async(conv_id)?;
-        match Self::recv_blocking(rx)? {
-            StoreResult::Sequence(r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn put_inbox(&self, key: &[u8], data: &[u8]) -> Result<(), StoreError> {
-        let rx = self.put_inbox_async(key, data)?;
-        match Self::recv_blocking(rx)? {
-            StoreResult::Stored(r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn get_inbox_range(&self, prefix: &[u8], limit: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
-        let rx = self.get_inbox_range_async(prefix, limit)?;
-        match Self::recv_blocking(rx)? {
-            StoreResult::InboxRange(r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn delete_inbox(&self, key: &[u8]) -> Result<(), StoreError> {
-        let rx = self.delete_inbox_async(key)?;
-        match Self::recv_blocking(rx)? {
-            StoreResult::Stored(r) => r,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn shutdown(&self) {
-        let _ = self.tx.send(Op::Shutdown);
-    }
 }
 
 // worker thread
@@ -226,7 +151,6 @@ fn spawn_worker(db: Database, rx: Receiver<Op>, notify: Notify, durable: Durabil
                 let _ = txn.open_table(TABLE_ACCOUNTS);
                 let _ = txn.open_table(TABLE_CONVERSATIONS);
                 let _ = txn.open_table(TABLE_INBOX);
-                let _ = txn.open_table(TABLE_MESSAGE_LOG);
                 let _ = txn.open_table(TABLE_SEQUENCE);
                 let _ = txn.commit();
             } else {
@@ -241,9 +165,7 @@ fn worker_loop(db: Database, rx: Receiver<Op>, notify: Notify, durable: Durabili
     loop {
         match rx.recv() {
             Ok(op) => {
-                if !process_op(&db, op, durable) {
-                    return;
-                }
+                process_op(&db, op, durable);
                 if let Some(f) = &notify {
                     f();
                 }
@@ -257,10 +179,8 @@ fn db_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Redb(e.to_string())
 }
 
-fn process_op(db: &Database, op: Op, durable: Durability) -> bool {
+fn process_op(db: &Database, op: Op, durable: Durability) {
     match op {
-        Op::Shutdown => return false,
-
         Op::PutAccount { user_id, data, tx } => {
             let result = (|| -> Result<(), StoreError> {
                 let mut txn = db.begin_write().map_err(db_err)?;
@@ -353,11 +273,11 @@ fn process_op(db: &Database, op: Op, durable: Durability) -> bool {
         }
 
         Op::GetInboxRange { prefix, limit, tx } => {
-            let result = (|| -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+            let result = (|| -> Result<Vec<InboxItem>, StoreError> {
                 let txn = db.begin_read().map_err(db_err)?;
                 let table = txn.open_table(TABLE_INBOX).map_err(db_err)?;
                 let range = table.range::<&[u8]>(prefix.as_slice()..).map_err(db_err)?;
-                let items: Vec<(Vec<u8>, Vec<u8>)> = range
+                let items: Vec<InboxItem> = range
                     .take(limit as usize)
                     .filter_map(|r| r.ok())
                     .map(|(k, v)| (k.value().to_vec(), v.value().to_vec()))
@@ -381,5 +301,4 @@ fn process_op(db: &Database, op: Op, durable: Durability) -> bool {
             let _ = tx.send(StoreResult::Stored(result));
         }
     }
-    true
 }
