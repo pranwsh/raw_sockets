@@ -5,7 +5,6 @@
 use libc::{c_int, c_void, size_t};
 use std::io;
 use std::os::unix::io::RawFd;
-use std::time::Duration;
 
 // non-blocking fd management
 
@@ -311,9 +310,4 @@ pub fn now_ms() -> u64 {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
     (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
-}
-
-/// compute an absolute deadline in ms from now
-pub fn deadline_after(dur: Duration) -> u64 {
-    now_ms().saturating_add(dur.as_millis() as u64)
 }
