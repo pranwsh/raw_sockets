@@ -1,63 +1,22 @@
 //! A reusable, term_render-based chat TUI frontend.
 //!
 //! This crate is a *pure frontend*: it owns the screen and keyboard, and it
-//! speaks a small, generic messaging model ([`UiAction`]/[`UiEvent`]) to an
-//! application-supplied [`ChatClient`]. It has no knowledge of any particular
-//! wire protocol. An app wires itself in by implementing [`ChatClient`] and
-//! calling [`run_app`].
+//! speaks the shared messaging model ([`chat_model::Action`]/[`chat_model::Event`])
+//! to an application-supplied [`ChatClient`]. It has no knowledge of any
+//! particular wire protocol. An app wires itself in by implementing
+//! [`ChatClient`] and calling [`run_app`].
 //!
-//! See the `msgcli` binary in the `socket_messaging` workspace for a reference
+//! See the `msgtui` binary (`src/bin/msgtui.rs`) in this crate for a reference
 //! integration that adapts this trait to its `msgclient` channel client.
 
+use chat_model::{Action, Event};
 use std::io;
 use term_render::event_handler::KeyCode;
 use term_render::render::{Colorize, ColorType, Span, Window};
 use tokio::runtime::Runtime;
 
 // ---------------------------------------------------------------------------
-// generic messaging model — the only contract the app must satisfy
-
-/// A high-level operation the TUI asks the app to perform.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UiAction {
-    /// authenticate (the account is created if it doesn't exist yet)
-    Login { user: String, password: String },
-    /// create a conversation with the given members
-    CreateConv { members: Vec<String> },
-    /// list the conversations the authenticated user is a member of
-    ListConvs,
-    /// send a message into a conversation
-    Send { conv: Vec<u8>, text: String },
-    /// send a keepalive ping
-    Ping,
-    /// send a clean goodbye and close the connection
-    Quit,
-}
-
-/// A high-level notification the app produces for the TUI.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UiEvent {
-    /// connection established (the transport is up)
-    Connected,
-    /// authentication succeeded; `created` is true when a new account was made
-    LoginOk { created: bool },
-    /// authentication was rejected
-    LoginFail { reason: String },
-    /// the server created a conversation and returned its id
-    ConvCreated { id: Vec<u8> },
-    /// the server's response to [`UiAction::ListConvs`]
-    Convs { ids: Vec<Vec<u8>> },
-    /// an inbound message (delivered to this connection)
-    Message { conv: Vec<u8>, from: String, seq: u64, text: String },
-    /// our [`UiAction::Send`] was accepted with a sequence number
-    Delivered { seq: u64 },
-    /// reply to [`UiAction::Ping`]
-    Pong,
-    /// the server reported an error
-    Error { msg: String },
-    /// the connection was closed
-    Disconnected { reason: String },
-}
+// client contract
 
 /// The adapter the app implements so the TUI never touches the wire.
 ///
@@ -66,9 +25,9 @@ pub enum UiEvent {
 /// [`poll_events`](ChatClient::poll_events) on each rendered frame.
 pub trait ChatClient: std::fmt::Debug {
     /// enqueue an action; returns false if the connection is gone
-    fn send(&self, action: UiAction) -> bool;
+    fn send(&self, action: Action) -> bool;
     /// drain any pending events into a `Vec` (non-blocking)
-    fn poll_events(&self) -> Vec<UiEvent>;
+    fn poll_events(&self) -> Vec<Event>;
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +36,7 @@ pub trait ChatClient: std::fmt::Debug {
 /// Launch the TUI with the supplied client adapter.
 ///
 /// `client` provides the connection; `user`/`password` cause an initial
-/// [`UiAction::Login`] (skip by passing empty strings); `conv_hex` optionally
+/// [`Action::Hello`] (skip by passing empty strings); `conv_hex` optionally
 /// pre-seeds a conversation (hex-encoded id) and selects it.
 ///
 /// This blocks until the user quits (Esc or `/quit`), running the term_render
@@ -89,7 +48,7 @@ pub fn run_app(
     conv_hex: Option<&str>,
 ) -> io::Result<()> {
     if !user.is_empty() {
-        let _ = client.send(UiAction::Login { user: user.to_string(), password: password.to_string() });
+        let _ = client.send(Action::Hello { user: user.to_string(), password: password.to_string() });
     }
 
     let mut ui = UiState {
@@ -114,7 +73,6 @@ pub fn run_app(
     rt.block_on(async {
         let mut app = term_render::App::<AppData>::new()?;
         build_windows(&mut app);
-        app.scene = None;
         let _ = app.run(data, tick).await;
         Ok::<(), io::Error>(())
     })
@@ -185,7 +143,7 @@ struct Message {
 
 fn tick(data: &mut AppData, app: &mut term_render::App<AppData>) -> Result<bool, ()> {
     // 1. consume client events
-    let pending: Vec<UiEvent> = match data.client.as_ref() {
+    let pending: Vec<Event> = match data.client.as_ref() {
         Some(client) => client.poll_events(),
         None => Vec::new(),
     };
@@ -199,7 +157,7 @@ fn tick(data: &mut AppData, app: &mut term_render::App<AppData>) -> Result<bool,
     }
     if data.ui.quit {
         if let Some(c) = data.client.take() {
-            let _ = c.send(UiAction::Quit);
+            let _ = c.send(Action::Goodbye);
         }
         return Ok(true);
     }
@@ -210,26 +168,26 @@ fn tick(data: &mut AppData, app: &mut term_render::App<AppData>) -> Result<bool,
     Ok(false)
 }
 
-fn apply_event(data: &mut AppData, ev: UiEvent) {
+fn apply_event(data: &mut AppData, ev: Event) {
     match ev {
-        UiEvent::Connected => {
+        Event::Connected => {
             data.ui.connected = true;
             data.ui.dirty = true;
         }
-        UiEvent::LoginOk { created } => {
+        Event::AuthOk { created } => {
             data.ui.authenticated = true;
             data.ui.status = if created { "authenticated (new account)".into() } else { "authenticated".into() };
             if let Some(c) = data.client.as_ref() {
-                c.send(UiAction::ListConvs);
+                c.send(Action::ListConvs);
             }
             data.ui.dirty = true;
         }
-        UiEvent::LoginFail { reason } => {
+        Event::AuthFail { reason } => {
             data.ui.authenticated = false;
             data.ui.status = format!("auth failed: {reason}");
             data.ui.dirty = true;
         }
-        UiEvent::ConvCreated { id } => {
+        Event::ConvCreated { id } => {
             let idx = match data.ui.convs.iter().position(|c| c.id == id) {
                 Some(i) => i,
                 None => {
@@ -242,7 +200,7 @@ fn apply_event(data: &mut AppData, ev: UiEvent) {
             data.ui.status = "conversation created".into();
             data.ui.dirty = true;
         }
-        UiEvent::Convs { ids } => {
+        Event::Convs { ids } => {
             for id in ids {
                 if !data.ui.convs.iter().any(|c| c.id == id) {
                     data.ui.convs.push(Conv::new(id));
@@ -254,7 +212,7 @@ fn apply_event(data: &mut AppData, ev: UiEvent) {
             data.ui.status = format!("{} conversations", data.ui.convs.len());
             data.ui.dirty = true;
         }
-        UiEvent::Message { conv, from, text, .. } => {
+        Event::Message { conv, from, text, .. } => {
             let idx = match data.ui.convs.iter().position(|c| c.id == conv) {
                 Some(i) => i,
                 None => {
@@ -270,19 +228,19 @@ fn apply_event(data: &mut AppData, ev: UiEvent) {
             }
             data.ui.dirty = true;
         }
-        UiEvent::Delivered { seq } => {
+        Event::Delivered { seq } => {
             data.ui.status = format!("delivered (seq {seq})");
             data.ui.dirty = true;
         }
-        UiEvent::Pong => {
+        Event::Pong => {
             data.ui.status = "pong".into();
             data.ui.dirty = true;
         }
-        UiEvent::Error { msg } => {
+        Event::Error { msg } => {
             data.ui.status = format!("error: {msg}");
             data.ui.dirty = true;
         }
-        UiEvent::Disconnected { reason } => {
+        Event::Disconnected { reason } => {
             data.ui.connected = false;
             data.ui.authenticated = false;
             data.ui.status = format!("disconnected: {reason}");
@@ -370,19 +328,19 @@ fn submit(data: &mut AppData, line: &str) {
                 if members.is_empty() {
                     data.ui.status = "usage: /create member1,member2".into();
                 } else if let Some(c) = data.client.as_ref() {
-                    c.send(UiAction::CreateConv { members });
+                    c.send(Action::CreateConv { members });
                     data.ui.status = "creating conversation...".into();
                 }
             }
             "list" => {
                 if let Some(c) = data.client.as_ref() {
-                    c.send(UiAction::ListConvs);
+                    c.send(Action::ListConvs);
                     data.ui.status = "listing conversations...".into();
                 }
             }
             "ping" => {
                 if let Some(c) = data.client.as_ref() {
-                    c.send(UiAction::Ping);
+                    c.send(Action::Ping);
                     data.ui.status = "ping sent".into();
                 }
             }
@@ -401,7 +359,7 @@ fn submit(data: &mut AppData, line: &str) {
         Some(i) => {
             let conv = data.ui.convs[i].id.clone();
             if let Some(c) = data.client.as_ref() {
-                c.send(UiAction::Send { conv, text: line.to_string() });
+                c.send(Action::Send { conv, text: line.to_string() });
             }
             // optimistic echo so the sender sees their own message immediately
             data.ui.convs[i].messages.push(Message { from: data.ui.user.clone(), text: line.to_string() });
