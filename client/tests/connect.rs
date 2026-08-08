@@ -1,85 +1,13 @@
 //! End-to-end test: spins up the real msgd server binary and drives it
 //! through the channel-based client API.
 
-use msgclient::{Action, Event, Client};
-use std::net::TcpListener;
-use std::path::PathBuf;
-use std::process::{Child, Command};
+mod common;
+
+use common::{connect_with_retry, start_server, wait_for};
+use msgclient::{Action, Event};
 use std::time::{Duration, Instant};
 
-const TIMEOUT: Duration = Duration::from_secs(8);
-
-fn server_bin() -> PathBuf {
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../target")
-        .join(profile)
-        .join("msgd")
-}
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
-struct Server {
-    child: Child,
-    port: u16,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn start_server() -> Server {
-    let port = free_port();
-    let data = std::env::temp_dir().join(format!("msgclient_it_{}_{}.redb", std::process::id(), port));
-    let _ = std::fs::remove_file(&data);
-    let child = Command::new(server_bin())
-        .args([
-            "--bind",
-            &format!("127.0.0.1:{port}"),
-            "--data",
-            data.to_str().unwrap(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn msgd server");
-    Server { child, port }
-}
-
-fn connect_with_retry(port: u16) -> Client {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        match Client::connect("127.0.0.1", port) {
-            Ok(c) => return c,
-            Err(_) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => panic!("connect failed: {e}"),
-        }
-    }
-}
-
-/// drain events until one matches `pred`, returning it (non-matching events are dropped)
-fn wait_for(client: &Client, pred: impl Fn(&Event) -> bool) -> Event {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        if let Some(ev) = client.events().try_iter().find(|ev| pred(ev)) {
-            return ev;
-        }
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for event");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn assert_auth_ok(client: &Client) {
+fn assert_auth_ok(client: &msgclient::Client) {
     let ev = wait_for(client, |e| matches!(e, Event::AuthOk { .. } | Event::AuthFail { .. }));
     assert!(matches!(ev, Event::AuthOk { .. }), "expected AuthOk, got {ev:?}");
 }
