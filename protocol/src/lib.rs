@@ -18,7 +18,6 @@ pub const MAX_BODY_LEN: usize = 16 * 1024 * 1024;
 
 pub const FLAG_COMPRESSED: u16 = 1 << 15;
 pub const FLAG_ACK_REQ: u16 = 1 << 14;
-pub const FLAG_PRIORITY: u16 = 1 << 13;
 pub const FLAG_MASK: u16 = 0xE000;
 pub const TYPE_MASK: u16 = 0x1FFF;
 
@@ -30,41 +29,24 @@ pub const TYPE_MASK: u16 = 0x1FFF;
 pub enum MsgType {
     // handshake / auth
     Hello = 1,
-    AuthChallenge = 2,
-    AuthResponse = 3,
     AuthOk = 4,
     AuthFail = 5,
     Goodbye = 6,
 
     // account / presence
     Presence = 10,
-    Typing = 11,
 
     // conversations
     CreateConv = 20,
     ConvCreated = 21,
-    ConvInvite = 22,
-    ConvJoin = 23,
-    ConvLeave = 24,
-    ConvMemberEvent = 25,
 
     // messaging
     Send = 30,
     Delivered = 31,
-    Read = 32,
-    HistoryReq = 33,
-    HistoryResp = 34,
-    InboxFetch = 35,
-    InboxResp = 36,
 
     // conversation listing
     ListConvs = 37,
     ConvsResp = 38,
-
-    // routing (inter-node) — uses the same frame on a cluster-internal socket
-    RouteAnnounce = 40,
-    RouteDeliver = 41,
-    NodeHello = 42,
 
     // control
     Ping = 90,
@@ -76,31 +58,16 @@ impl MsgType {
     pub fn from_u16(v: u16) -> Option<Self> {
         Some(match v {
             1 => Self::Hello,
-            2 => Self::AuthChallenge,
-            3 => Self::AuthResponse,
             4 => Self::AuthOk,
             5 => Self::AuthFail,
             6 => Self::Goodbye,
             10 => Self::Presence,
-            11 => Self::Typing,
             20 => Self::CreateConv,
             21 => Self::ConvCreated,
-            22 => Self::ConvInvite,
-            23 => Self::ConvJoin,
-            24 => Self::ConvLeave,
-            25 => Self::ConvMemberEvent,
             30 => Self::Send,
             31 => Self::Delivered,
-            32 => Self::Read,
-            33 => Self::HistoryReq,
-            34 => Self::HistoryResp,
-            35 => Self::InboxFetch,
-            36 => Self::InboxResp,
             37 => Self::ListConvs,
             38 => Self::ConvsResp,
-            40 => Self::RouteAnnounce,
-            41 => Self::RouteDeliver,
-            42 => Self::NodeHello,
             90 => Self::Ping,
             91 => Self::Pong,
             99 => Self::Error,
@@ -121,26 +88,12 @@ pub struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    pub fn new(msg_type: MsgType, body: &'a [u8]) -> Self {
-        Self { version: VERSION, flags: 0, msg_type, body }
-    }
-
-    pub fn with_flags(mut self, flags: u16) -> Self {
-        self.flags = flags & FLAG_MASK;
-        self
-    }
-
     pub fn is_compressed(&self) -> bool {
         self.flags & FLAG_COMPRESSED != 0
     }
 
     pub fn ack_requested(&self) -> bool {
         self.flags & FLAG_ACK_REQ != 0
-    }
-
-    /// total on-the-wire length including header and CRC trailer
-    pub fn wire_len(&self) -> usize {
-        HEADER_LEN + self.body.len() + TRAILER_LEN
     }
 }
 
@@ -216,6 +169,76 @@ pub fn seal(buf: &mut [u8], msg_type: MsgType, flags: u16, body_len: usize) -> u
     let crc = crc32c(&buf[1..HEADER_LEN + body_len]);
     buf[HEADER_LEN + body_len..total].copy_from_slice(&crc.to_le_bytes());
     total
+}
+
+// wire body formats — the application-level encodings shared by the client
+// and server so the layouts live in exactly one place
+
+/// body of a `Hello`: `<user>\n<password>`
+pub fn hello_body(user: &[u8], password: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(user.len() + 1 + password.len());
+    body.extend_from_slice(user);
+    body.push(b'\n');
+    body.extend_from_slice(password);
+    body
+}
+
+/// split a `Hello` body into (user, password)
+pub fn split_hello(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    split_at_newline(body)
+}
+
+/// body of a client→server `Send`: `<conv_id>\n<text>`
+pub fn send_body(conv: &[u8], text: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(conv.len() + 1 + text.len());
+    body.extend_from_slice(conv);
+    body.push(b'\n');
+    body.extend_from_slice(text);
+    body
+}
+
+/// split a client→server `Send` body into (conv_id, text)
+pub fn split_send(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    split_at_newline(body)
+}
+
+/// body of a server→client delivery `Send`:
+/// `<conv_id>\n<seq:8le>\n<sender>\n<text>`
+pub fn delivery_body(conv: &[u8], seq: u64, sender: &[u8], text: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(conv.len() + 1 + 8 + 1 + sender.len() + 1 + text.len());
+    body.extend_from_slice(conv);
+    body.push(b'\n');
+    body.extend_from_slice(&write_u64_le(seq));
+    body.push(b'\n');
+    body.extend_from_slice(sender);
+    body.push(b'\n');
+    body.extend_from_slice(text);
+    body
+}
+
+/// split a delivery body into (conv_id, seq, sender, text)
+pub type Delivery<'a> = (&'a [u8], u64, &'a [u8], &'a [u8]);
+pub fn split_delivery(body: &[u8]) -> Option<Delivery<'_>> {
+    let (conv, rest) = split_at_newline(body)?;
+    let seq = read_u64_le(rest)?;
+    // skip the 8 seq bytes plus the separating `\n` to reach `<sender>\n<text>`
+    let (sender, text) = split_at_newline(&rest[9..])?;
+    Some((conv, seq, sender, text))
+}
+
+/// 8-byte little-endian encoding of a sequence number
+pub fn write_u64_le(v: u64) -> [u8; 8] {
+    v.to_le_bytes()
+}
+
+/// decode an 8-byte little-endian u64 from the front of `b`
+pub fn read_u64_le(b: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(b.get(..8)?.try_into().ok()?))
+}
+
+fn split_at_newline(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    let sep = body.iter().position(|&b| b == b'\n')?;
+    Some((&body[..sep], &body[sep + 1..]))
 }
 
 // decoder
