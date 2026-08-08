@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 use std::io::Read;
 /// Handling terminal events (key presses, mouse events, etc.)
 /// This module provides functionality to parse and manage terminal input events.
