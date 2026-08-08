@@ -68,10 +68,7 @@ pub struct Reactor<H: EventHandler> {
     written_buf: Vec<ConnectionId>,
 
     /// whether the loop should exit on the next tick
-    pub shutdown: bool,
-
-    // stats / debug
-    pub total_connections: u64,
+    shutdown: bool,
 }
 
 /// epoll u64 sentinel for the wake eventfd (no connection ID can equal this)
@@ -109,12 +106,11 @@ impl<H: EventHandler> Reactor<H> {
             overflow_buf: Vec::new(),
             written_buf: Vec::new(),
             shutdown: false,
-            total_connections: 0,
         })
     }
 
     /// shut down this reactor, closing all connections
-    pub fn shutdown(&mut self) {
+    fn shutdown(&mut self) {
         self.shutdown = true;
         let ids: Vec<ConnectionId> = self.connections.keys().copied().collect();
         for id in ids {
@@ -126,13 +122,8 @@ impl<H: EventHandler> Reactor<H> {
         self.connections.clear();
     }
 
-    /// return a mutable reference to the event handler (e.g for tests that want to inspect state)
-    pub fn handler(&mut self) -> &mut H {
-        &mut self.handler
-    }
-
     /// run one iteration of the event loop
-    pub fn tick(&mut self) -> io::Result<()> {
+    fn tick(&mut self) -> io::Result<()> {
         if self.shutdown {
             return Ok(());
         }
@@ -186,8 +177,7 @@ impl<H: EventHandler> Reactor<H> {
         // drain any frames/teardowns queued by tick() (or earlier by on_frame() handlers that were not drained inside handle_read)
         self.drain_handler_queues();
 
-        // idle timeout sweep (runs every tick; cheap and keeps teardowns timely).
-        // NOTE: idle marking is currently disabled — see sweep_timeouts().
+        // reap connections whose teardown has completed
         self.sweep_timeouts();
 
         Ok(())
@@ -220,7 +210,7 @@ impl<H: EventHandler> Reactor<H> {
                         std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr)),
                         u16::from_be(addr.sin_port),
                     );
-                    let conn = Connection::new(fd, peer, id);
+                    let conn = Connection::new(fd);
                     // register in epoll (ET | IN for reads)
                     if let Err(e) = sys::epoll_add(
                         self.epoll_fd,
@@ -233,7 +223,6 @@ impl<H: EventHandler> Reactor<H> {
                     }
                     self.handler.on_accept(id, peer);
                     self.connections.insert(id, conn);
-                    self.total_connections += 1;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(e) => return Err(e),
@@ -254,58 +243,17 @@ impl<H: EventHandler> Reactor<H> {
             self.handler.on_frame(id, frame);
         }
 
-        // drain outbound frames, tracking connections for backpressure
-        // swap out the buffer to avoid borrowing self while iterating
-        self.handler.drain_outbound(&mut self.outbound_buf);
-        let mut outbound = std::mem::take(&mut self.outbound_buf);
-        self.overflow_buf.clear();
-        self.written_buf.clear();
-        for (target_id, frame) in outbound.drain(..) {
-            match self.send_to(target_id, &frame) {
-                WriteOutcome::Overflow => self.overflow_buf.push(target_id),
-                WriteOutcome::Queued => self.written_buf.push(target_id),
-                _ => {}
-            }
-        }
-        self.outbound_buf = outbound;
-
-        // tear down connections whose write buffer exceeded HARD_CAP
-        for &target_id in &self.overflow_buf {
-            if let Some(conn) = self.connections.get_mut(&target_id) {
-                conn.start_teardown(TeardownReason::SlowClient);
-            }
+        // apply backpressure to the source connection
+        if let Some(conn) = self.connections.get_mut(&id)
+            && conn.should_pause_reading() && conn.teardown.is_none()
+        {
+            conn.read_paused = true;
+            let events = (libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
+            let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, id.into());
         }
 
-        // apply backpressure to target connections with high write buffer
-        for &target_id in &self.written_buf {
-            if let Some(conn) = self.connections.get_mut(&target_id) {
-                if conn.should_pause_reading() && conn.teardown.is_none() {
-                    conn.read_paused = true;
-                    let events =
-                        (libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
-                    let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, target_id.into());
-                }
-            }
-        }
-
-        // also apply backpressure to the source connection (original behavior)
-        if let Some(conn) = self.connections.get_mut(&id) {
-            if conn.should_pause_reading() && conn.teardown.is_none() {
-                conn.read_paused = true;
-                let events = (libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
-                let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, id.into());
-            }
-        }
-
-        // drain teardown requests from the handler
-        self.handler.drain_teardowns(&mut self.teardown_buf);
-        let mut teardowns = std::mem::take(&mut self.teardown_buf);
-        for (teardown_id, reason) in teardowns.drain(..) {
-            if let Some(conn) = self.connections.get_mut(&teardown_id) {
-                conn.start_teardown(reason);
-            }
-        }
-        self.teardown_buf = teardowns;
+        // drain outbound frames and teardowns queued by the on_frame handlers
+        self.drain_handler_queues();
     }
 
     /// read and decode any available frames into the reusable buffer
@@ -401,44 +349,15 @@ impl<H: EventHandler> Reactor<H> {
         }
     }
 
-    /// check idle deadlines; tear down stale connections
+    /// close connections whose teardown has completed
     fn sweep_timeouts(&mut self) {
         let now = sys::now_ms();
-
-        // 1 mark idle connections for teardown.
-        //
-        // The idle timeout is currently DISABLED: a chat client sends only on
-        // user input, so it is legitimately silent for long stretches. Killing
-        // it after 60s of inactivity breaks long-lived sessions. Keep the
-        // teardown-completion pass below (genuine EOFs and explicit Goodbyes
-        // still get reaped). To re-enable idle pruning, set this to true and
-        // make sure the client auto-pings well within DEFAULT_IDLE_TIMEOUT.
-        const ENFORCE_IDLE_TIMEOUT: bool = false;
-
-        if ENFORCE_IDLE_TIMEOUT {
-            let mut expired: Vec<ConnectionId> = Vec::new();
-            for (&id, conn) in &self.connections {
-                if conn.teardown.is_none() && conn.idle_deadline <= now {
-                    expired.push(id);
-                }
-            }
-            for &id in &expired {
-                if let Some(conn) = self.connections.get_mut(&id) {
-                    conn.start_teardown(TeardownReason::IdleTimeout);
-                    let events =
-                        (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
-                    let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, id.into());
-                }
-            }
-        }
-
-        // 2 close connections whose teardown is complete
         let mut to_remove: Vec<(ConnectionId, TeardownReason)> = Vec::new();
         for (&id, conn) in &self.connections {
-            if let Some(state) = &conn.teardown {
-                if conn.is_write_empty() || now >= state.flush_deadline {
-                    to_remove.push((id, state.reason));
-                }
+            if let Some(state) = &conn.teardown
+                && (conn.is_write_empty() || now >= state.flush_deadline)
+            {
+                to_remove.push((id, state.reason));
             }
         }
         for (id, reason) in to_remove {
@@ -451,7 +370,7 @@ impl<H: EventHandler> Reactor<H> {
     }
 
     /// enqueue a frame to a specific connection
-    pub fn send_to(&mut self, id: ConnectionId, frame: &[u8]) -> WriteOutcome {
+    fn send_to(&mut self, id: ConnectionId, frame: &[u8]) -> WriteOutcome {
         let Some(conn) = self.connections.get_mut(&id) else {
             return WriteOutcome::Rejected;
         };
@@ -464,11 +383,6 @@ impl<H: EventHandler> Reactor<H> {
             let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, id.into());
         }
         result
-    }
-
-    /// returns the number of connected clients
-    pub fn connection_count(&self) -> usize {
-        self.connections.len()
     }
 
     /// drain outbound frames and teardowns from the handler and apply them
@@ -493,13 +407,13 @@ impl<H: EventHandler> Reactor<H> {
         }
 
         for &target_id in &self.written_buf {
-            if let Some(conn) = self.connections.get_mut(&target_id) {
-                if conn.should_pause_reading() && conn.teardown.is_none() {
-                    conn.read_paused = true;
-                    let events =
-                        (libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
-                    let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, target_id.into());
-                }
+            if let Some(conn) = self.connections.get_mut(&target_id)
+                && conn.should_pause_reading() && conn.teardown.is_none()
+            {
+                conn.read_paused = true;
+                let events =
+                    (libc::EPOLLOUT | libc::EPOLLET | libc::EPOLLRDHUP) as u32;
+                let _ = sys::epoll_mod(self.epoll_fd, conn.fd, events, target_id.into());
             }
         }
 
