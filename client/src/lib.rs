@@ -4,11 +4,13 @@
 //! - **in**: high-level [`Action`]s (authenticate, create a conversation, send a message, ping, goodbye)
 //! - **out**: high-level [`Event`]s (auth results, incoming messages, deliveries, errors, disconnects)
 //!
-//! A frontend (like the term_render TUI) only ever speaks these two types; all
-//! wire framing lives behind the `protocol` crate. Because the interface is
-//! just channels, other programs can plug in later without touching the TUI.
+//! The [`Action`]/[`Event`] model lives in the `chat-model` crate (re-exported
+//! here) so the term_render TUI and other frontends share it without any wire
+//! knowledge. All framing lives behind the `protocol` crate.
 
 #![forbid(unsafe_code)]
+
+pub use chat_model::{Action, Event};
 
 use protocol::{self, Decode, MsgType, OwnedFrame};
 use std::io::{self, Read, Write};
@@ -16,48 +18,6 @@ use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-
-/// a high-level operation the caller wants the connected server to perform
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    /// authenticate (the account is created if it doesn't exist yet)
-    Hello { user: String, password: String },
-    /// create a conversation with the given members; the authenticated user is prepended automatically
-    CreateConv { members: Vec<String> },
-    /// list the conversations the authenticated user is a member of
-    ListConvs,
-    /// send a message into a conversation
-    Send { conv: Vec<u8>, text: String },
-    /// send a keepalive ping
-    Ping,
-    /// send a clean goodbye and close the connection
-    Goodbye,
-}
-
-/// a high-level notification produced by the client
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
-    /// connection established (the socket is up)
-    Connected,
-    /// authentication succeeded; `created` is true when a new account was made
-    AuthOk { created: bool },
-    /// authentication was rejected
-    AuthFail { reason: String },
-    /// the server created a conversation and returned its id
-    ConvCreated { id: Vec<u8> },
-    /// the server's response to [`Action::ListConvs`]
-    Convs { ids: Vec<Vec<u8>> },
-    /// an inbound message (delivered to this connection)
-    Message { conv: Vec<u8>, from: String, seq: u64, text: String },
-    /// our [`Action::Send`] was accepted with a sequence number
-    Delivered { seq: u64 },
-    /// reply to [`Action::Ping`]
-    Pong,
-    /// the server reported an error
-    Error { msg: String },
-    /// the connection was closed
-    Disconnected { reason: String },
-}
 
 /// a connected client: send [`Action`]s in, receive [`Event`]s out
 #[derive(Debug)]
@@ -177,10 +137,7 @@ fn encode_action(action: Action, authenticated: &mut Option<Vec<u8>>) -> Option<
     match action {
         Action::Hello { user, password } => {
             *authenticated = Some(user.clone().into_bytes());
-            let mut body = Vec::with_capacity(user.len() + 1 + password.len());
-            body.extend_from_slice(user.as_bytes());
-            body.push(b'\n');
-            body.extend_from_slice(password.as_bytes());
+            let body = protocol::hello_body(user.as_bytes(), password.as_bytes());
             Some((MsgType::Hello, body.into_boxed_slice()))
         }
         Action::CreateConv { mut members } => {
@@ -195,10 +152,7 @@ fn encode_action(action: Action, authenticated: &mut Option<Vec<u8>>) -> Option<
         }
         Action::ListConvs => Some((MsgType::ListConvs, Vec::new().into_boxed_slice())),
         Action::Send { conv, text } => {
-            let mut body = Vec::with_capacity(conv.len() + 1 + text.len());
-            body.extend_from_slice(&conv);
-            body.push(b'\n');
-            body.extend_from_slice(text.as_bytes());
+            let body = protocol::send_body(&conv, text.as_bytes());
             Some((MsgType::Send, body.into_boxed_slice()))
         }
         Action::Ping => Some((MsgType::Ping, Vec::new().into_boxed_slice())),
@@ -227,32 +181,20 @@ fn decode_event(f: OwnedFrame) -> Event {
         }
         MsgType::Send => {
             // body: conv_id "\n" seq(8 LE) sender "\n" text
-            let Some(sep) = f.body.iter().position(|&b| b == b'\n') else {
-                return Event::Error { msg: "malformed inbound Send frame".into() };
-            };
-            let conv = f.body[..sep].to_vec();
-            let after = &f.body[sep + 1..];
-            let (seq, rest) = if after.len() >= 8 {
-                let seq = u64::from_le_bytes(after[..8].try_into().unwrap());
-                (seq, &after[8..])
-            } else {
-                return Event::Error { msg: "malformed inbound Send frame".into() };
-            };
-            let (from, text) = match rest.iter().position(|&b| b == b'\n') {
-                Some(p) => (
-                    String::from_utf8_lossy(&rest[..p]).into_owned(),
-                    String::from_utf8_lossy(&rest[p + 1..]).into_owned(),
-                ),
-                None => (String::from_utf8_lossy(rest).into_owned(), String::new()),
-            };
-            Event::Message { conv, from, seq, text }
+            match protocol::split_delivery(&f.body) {
+                Some((conv, seq, from, text)) => Event::Message {
+                    conv: conv.to_vec(),
+                    from: String::from_utf8_lossy(from).into_owned(),
+                    seq,
+                    text: String::from_utf8_lossy(text).into_owned(),
+                },
+                None => Event::Error { msg: "malformed inbound Send frame".into() },
+            }
         }
         MsgType::Delivered => {
-            if f.body.len() >= 8 {
-                let seq = u64::from_le_bytes(f.body[..8].try_into().unwrap());
-                Event::Delivered { seq }
-            } else {
-                Event::Error { msg: "malformed Delivered frame".into() }
+            match protocol::read_u64_le(&f.body) {
+                Some(seq) => Event::Delivered { seq },
+                None => Event::Error { msg: "malformed Delivered frame".into() },
             }
         }
         MsgType::Pong => Event::Pong,
@@ -345,6 +287,7 @@ mod tests {
         let mut conv = vec![0xAA; 8];
         conv.push(b'\n');
         conv.extend_from_slice(&42u64.to_le_bytes());
+        conv.push(b'\n');
         conv.extend_from_slice(b"carol\nhey!");
         let ev = event_from(MsgType::Send, &conv);
         assert_eq!(
