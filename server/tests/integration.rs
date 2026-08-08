@@ -2,15 +2,25 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, SocketAddr};
+use std::path::PathBuf;
 use std::process::{Command, Child};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // reuse the workspace's protocol crate for frame encoding/decoding
 // this is the actual protocol logic — the test verifies that the server speaks it correctly
 use protocol::{self, MsgType, OwnedFrame, Decode};
 
 // helpers
+
+const START_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn server_bin() -> PathBuf {
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target")
+        .join(profile)
+        .join("msgd")
+}
 
 /// wraps a child process and kills it on drop
 struct ServerGuard {
@@ -19,8 +29,6 @@ struct ServerGuard {
 
 impl ServerGuard {
     fn new(child: Child) -> Self {
-        // give the server time to start
-        thread::sleep(Duration::from_millis(200));
         Self { child: Some(child) }
     }
 }
@@ -40,7 +48,7 @@ fn spawn_server() -> (ServerGuard, SocketAddr) {
     let data_path = format!("/tmp/msgd_test_{}", port);
     let bind = format!("127.0.0.1:{}", port);
 
-    let child = Command::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../target/debug/msgd"))
+    let child = Command::new(server_bin())
         .arg("--bind")
         .arg(&bind)
         .arg("--data")
@@ -66,8 +74,16 @@ struct TestClient {
 }
 
 impl TestClient {
+    /// connect with retry so a just-spawned server doesn't flake the test
     fn connect(addr: SocketAddr) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+        let deadline = Instant::now() + START_TIMEOUT;
+        let stream = loop {
+            match TcpStream::connect(addr) {
+                Ok(s) => break s,
+                Err(_e) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => return Err(e),
+            }
+        };
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         Ok(Self { stream, buf: Vec::with_capacity(65536), read_offset: 0 })
@@ -81,10 +97,7 @@ impl TestClient {
 
     /// send a Hello(user_id \n password) frame
     fn hello(&mut self, user_id: &[u8], password: &[u8]) {
-        let mut body = Vec::new();
-        body.extend_from_slice(user_id);
-        body.push(b'\n');
-        body.extend_from_slice(password);
+        let body = protocol::hello_body(user_id, password);
         self.send_frame(MsgType::Hello, 0, &body);
     }
 
@@ -204,13 +217,11 @@ fn test_create_conv_and_send() {
     let conv_id = created.body.to_vec();
 
     // send a message to the conversation
-    let mut msg = Vec::new();
-    msg.extend_from_slice(&conv_id);
-    msg.push(b'\n');
-    msg.extend_from_slice(b"Hello, Bob!");
+    let msg = protocol::send_body(&conv_id, b"Hello, Bob!");
     alice.send_frame(MsgType::Send, 0, &msg);
 
-    // the send triggers: (1) a send frame echoing the message back to the sender (inbox delivery), then (2) a delivered ack
+    // alice should get a Delivered ack for her send (other members are the
+    // only ones who receive the message frame itself)
     loop {
         let f = alice.recv_frame();
         if f.msg_type == MsgType::Delivered {
