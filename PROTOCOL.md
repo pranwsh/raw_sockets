@@ -131,9 +131,15 @@ Creates a deterministic conversation ID (hash of sorted member list). Minimum
 
 ### `ConvCreated` (21) — Server → Client
 
-**Body**: 8-byte conversation ID (little-endian u64 hash).
+**Body**: one conversation record, in the same format `ConvsResp` uses:
 
-Sent in response to `CreateConv`.
+```
+<8-byte conv id><comma-separated member ids>\n
+```
+
+Sent in response to `CreateConv`. The member list travels with the reply so
+the creating client can label the conversation without a follow-up
+`ListConvs`.
 
 ### `Send` (30) — Client → Server / Server → Client
 
@@ -274,7 +280,7 @@ if msg_type == 5:       # AuthFail
 
 # Create conversation
 sock.sendall(encode(20, b'alice,bob'))
-conv_id = recv_frame(sock)   # ConvCreated
+conv_id = recv_frame(sock)   # ConvCreated (id + member list)
 
 # Send message
 body = conv_id + b'\nHello, Bob!'

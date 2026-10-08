@@ -124,12 +124,12 @@ following types are **implemented** by the server today:
 | 6 | `Goodbye` | both | Clean teardown | empty |
 | 10 | `Presence` | both | Pass-through echo (reserved for presence) | opaque |
 | 20 | `CreateConv` | C→S | Create a conversation (≥ 2 members) | comma-separated ids |
-| 21 | `ConvCreated` | S→C | Conv id for the new conversation | 8-byte u64 LE id |
+| 21 | `ConvCreated` | S→C | The new conversation | `<8-byte id><members>\n` record |
 | 30 | `Send` | C→S | Send a message | `<conv_id>\n<message_body>` |
 | 30 | `Send` | S→C | Deliver a message (inbox push) | `<conv_id>\n<seq:8le>\n<sender>\n<body>` |
 | 31 | `Delivered` | S→C | Ack: message persisted and queued | `<seq:8le>` |
 | 37 | `ListConvs` | C→S | List the user's conversations | empty |
-| 38 | `ConvsResp` | S→C | Conversation ids | concatenated 8-byte u64 LE ids |
+| 38 | `ConvsResp` | S→C | The user's conversations, with member names | concatenated `<8-byte id><members>\n` records |
 | 90 | `Ping` | both | Keepalive | empty |
 | 91 | `Pong` | both | Ping reply | empty |
 | 99 | `Error` | S→C | Application error; connection stays open | UTF-8 string |
