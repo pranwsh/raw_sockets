@@ -10,10 +10,10 @@ use crate::util;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+#[cfg(test)]
+use std::time::Instant;
 
 const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
@@ -44,9 +44,17 @@ pub fn draw(frame: &mut Frame, state: &mut State, epoch_base: std::time::Instant
     if let Some(side) = sidebar_area {
         draw_sidebar(frame, state, side);
     }
-    draw_transcript(frame, state, main_area, epoch_base);
-    draw_composer(frame, state, main_area);
-    draw_status(frame, state, area);
+    // stack transcript, composer and status vertically; they must not share a
+    // rect or the panes overdraw each other
+    let [body, composer, status] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .areas(main_area);
+    draw_transcript(frame, state, body, epoch_base);
+    draw_composer(frame, state, composer);
+    draw_status(frame, state, status);
 
     match state.overlay {
         Overlay::Filter => draw_filter(frame, state, area),
@@ -92,7 +100,6 @@ fn draw_sidebar(frame: &mut Frame, state: &mut State, area: Rect) {
     // only build as many rows as fit, plus one so the scroll math is visible
     let capacity = inner.height as usize;
     let start = visible.len().saturating_sub(capacity);
-    let selected_pos = visible.iter().position(|&i| state.is_selected(i));
 
     let mut items: Vec<ListItem> = Vec::with_capacity(capacity);
     for (row, &idx) in visible.iter().enumerate().skip(start) {
@@ -103,57 +110,79 @@ fn draw_sidebar(frame: &mut Frame, state: &mut State, area: Rect) {
 
     frame.render_widget(block, area);
 
-    let list = List::new(items).highlight_style(Style::default());
-    let mut list_state = ListState::default();
-    // ListState indexes within the rendered slice
-    list_state.select(
-        selected_pos
-            .map(|p| p - start)
-            .filter(|_| state.focus == Focus::Sidebar),
-    );
-    frame.render_stateful_widget(list, inner, &mut list_state);
+    // Selection styling is applied per item above rather than through
+    // `List`'s highlight, because the highlight style replaces the row's own
+    // styling and would drop the background that makes the row readable.
+    frame.render_widget(List::new(items), inner);
 }
 
 /// One sidebar row: unread dot, label, and a preview line.
+///
+/// The row background is applied to the leading marker and dot spans too, so
+/// the selection highlight spans the full width of the row instead of
+/// stopping where a styled span begins.
 fn conv_item(state: &State, idx: usize, is_selected: bool, is_cursor: bool) -> ListItem<'static> {
     let c = &state.entries_at(idx);
-    let marker = if is_cursor { "▌" } else { " " };
-    let dot = if c.unread > 0 { "●" } else { " " };
-    let dot_style = if c.unread > 0 {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+
+    // base style for the whole row; spans below only override what differs
+    let base = if is_selected {
+        Style::default().fg(Color::Black).bg(ACCENT)
     } else {
         Style::default()
     };
-
-    let count = if c.unread > 0 {
-        format!(" {}", c.unread)
-    } else {
-        String::new()
+    let emphasis = |base: Style, extra: Style| -> Style {
+        let mut s = base;
+        if let Some(fg) = extra.fg { s = s.fg(fg); }
+        if let Some(bg) = extra.bg { s = s.bg(bg); }
+        if extra.add_modifier.contains(Modifier::BOLD) {
+            s = s.add_modifier(Modifier::BOLD);
+        }
+        s
     };
 
-    let label_style = if is_selected {
-        Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
-    } else if c.unread > 0 {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
+    let marker = if is_cursor { "▌" } else { " " };
+    let dot = if c.unread > 0 { "●" } else { " " };
+    let dot_style = emphasis(
+        base,
+        if c.unread > 0 { Style::default().fg(if is_selected { Color::Black } else { ACCENT }) } else { Style::default() },
+    );
+
+    let count = if c.unread > 0 { format!(" {}", c.unread) } else { String::new() };
+    let count_style = emphasis(
+        base,
+        if c.unread > 0 { Style::default().fg(if is_selected { Color::Black } else { ACCENT }) } else { Style::default() },
+    );
+
+    let label_style = emphasis(
+        base,
+        if is_selected {
+            Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)
+        } else if c.unread > 0 {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        },
+    );
 
     let label = util::truncate(&state.label_of(idx), 28);
     let first = Line::from(vec![
-        Span::styled(marker, Style::default().fg(ACCENT)),
+        Span::styled(marker, base.fg(if is_cursor { ACCENT } else { base.fg.unwrap_or(Color::Reset) })),
         Span::styled(dot, dot_style),
         Span::styled(label, label_style),
-        Span::styled(count, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(count, count_style),
     ]);
 
     let preview_style = if is_selected {
-        Style::default().fg(Color::Black).bg(ACCENT)
+        base
     } else {
         Style::default().fg(DIM)
     };
     let preview = util::truncate(
-        &if c.last_text.is_empty() { "(no messages yet)".to_string() } else { util::one_line(&c.last_text) },
+        &if c.last_text.is_empty() {
+            "(no messages yet)".to_string()
+        } else {
+            util::one_line(&c.last_text)
+        },
         30,
     );
     let second = Line::from(vec![
@@ -431,4 +460,110 @@ fn draw_new_conv(frame: &mut Frame, state: &State, area: Rect) {
         Line::from(Span::styled("comma separated, e.g. bob,carol   ·   Enter create  ·   Esc cancel", Style::default().fg(DIM))),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::State;
+    use chat_model::{ConvInfo, Event};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// render `state` into an in-memory terminal and return the visible text
+    fn draw_to_text(state: &mut State, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        let base = Instant::now();
+        term.draw(|f| draw(f, state, base)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            let mut line = String::new();
+            for x in 0..buf.area.width {
+                line.push_str(&buf[(x, y)].symbol());
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
+    fn seeded() -> State {
+        let mut s = State::new();
+        s.me = "alice".into();
+        s.connected = true;
+        s.authenticated = true;
+        s.apply(Event::Convs {
+            convs: vec![
+                ConvInfo { id: vec![0xab; 8], members: vec!["alice".into(), "bob".into()] },
+                ConvInfo { id: vec![0xcd; 8], members: vec!["alice".into(), "carol".into()] },
+            ],
+        });
+        s
+    }
+
+    #[test]
+    fn panes_do_not_overlap() {
+        let mut s = seeded();
+        s.select(1);
+        let text = draw_to_text(&mut s, 100, 24);
+        // every pane gets its own region, so all three borders must appear
+        assert!(text.contains("chats"), "sidebar missing:\n{text}");
+        assert!(text.contains("input"), "composer missing:\n{text}");
+        assert!(text.contains("online"), "status bar missing:\n{text}");
+    }
+
+    #[test]
+    fn transcript_shows_the_selected_conversation() {
+        let mut s = seeded();
+        s.select(1);
+        s.apply(Event::Message {
+            conv: vec![0xcd; 8],
+            from: "carol".into(),
+            seq: 1,
+            text: "hello from carol".into(),
+        });
+        let text = draw_to_text(&mut s, 100, 24);
+        assert!(text.contains("carol: hello from carol"), "transcript wrong:\n{text}");
+        // the sidebar labels the conversation by its members
+        assert!(text.contains("carol"), "label missing:\n{text}");
+    }
+
+    #[test]
+    fn filter_overlay_reports_the_matched_count() {
+        let mut s = seeded();
+        s.filter = "carol".into();
+        s.overlay = Overlay::Filter;
+        let text = draw_to_text(&mut s, 100, 24);
+        // one of two conversations matches
+        assert!(text.contains("1/2"), "filter count wrong:\n{text}");
+        assert!(text.contains("search:"), "filter prompt missing:\n{text}");
+    }
+
+    #[test]
+    fn login_overlay_masks_the_password() {
+        let mut s = seeded();
+        s.authenticated = false;
+        state_reset_login(&mut s);
+        s.login_pass = "hunter2".into();
+        s.overlay = Overlay::Login;
+        let text = draw_to_text(&mut s, 100, 24);
+        assert!(!text.contains("hunter2"), "password leaked:\n{text}");
+        assert!(text.contains("*******"), "mask missing:\n{text}");
+    }
+
+    #[test]
+    fn narrow_terminal_hides_the_sidebar() {
+        let mut s = seeded();
+        s.select(1);
+        // below the combined minimum width the sidebar is dropped so the
+        // transcript keeps a usable area
+        let text = draw_to_text(&mut s, 40, 12);
+        assert!(!text.contains("chats"), "sidebar should be hidden at 40 cols:\n{text}");
+        assert!(text.contains("input"), "composer missing:\n{text}");
+    }
+
+    fn state_reset_login(s: &mut State) {
+        s.login_user = "alice".into();
+    }
 }

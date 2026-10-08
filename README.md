@@ -96,10 +96,16 @@ Usage: msgtui [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [-
 | `--conv` | *(none)* | Conversation id (hex) to pre-select. |
 | `--help` / `-h` | — | Show usage and exit. |
 
-Interactive term_render TUI (see [`msgtui`](#msgtui--the-tui-frontend)). Slash
-commands inside the input box: `/create a,b`, `/list`, `/ping`, `/quit`; typing a
-plain line sends it into the selected conversation. Tab switches focus between
-the conversation list and the input box; Esc or `/quit` exits.
+Interactive ratatui TUI (see [`msgtui`](#msgtui--the-tui-frontend)). Slash
+commands inside the input box: `/login`, `/logout`, `/create a,b`, `/new`,
+`/list`, `/filter`, `/ping`, `/quit`; typing a plain line sends it into the
+selected conversation.
+
+Conversations are listed by their member names (`alice, bob`) rather than
+opaque ids, with unread badges and a preview of the latest message. `/filter`
+narrows the list by member, message text, or id. `Tab` cycles focus between the
+conversation list, the transcript and the input box; `↑`/`↓` move, `Enter`
+opens, `PageUp`/`PageDown` scroll the transcript, and `Esc` or `/quit` exits.
 
 `msgtui` is a launcher for the reusable `msgtui` crate: it connects through the
 channel-based `msgclient` client and adapts it to the TUI's `ChatClient` trait.
@@ -238,18 +244,24 @@ async (non-blocking, used by the event loop):
 
 ### `msgtui` — the TUI frontend
 
-The [`msgtui`](tui) crate is a reusable, term_render-based chat TUI that drives
-a generic `ChatClient` trait (`send(Action)`, `poll_events() -> Vec<Event>`).
-The `Action`/`Event` types live in the [`chat-model`](chat-model) crate. The
-`msgtui` binary in `tui/src/bin/` wires the TUI to
-[`msgclient`](#msgclient--the-channel-client) through `tui_client.rs` — the
-adapter that implements `ChatClient` for the channel client.
+The [`msgtui`](tui) crate is a reusable, [ratatui](https://ratatui.rs)-based
+chat TUI that drives a generic `ChatClient` trait (`send(Action)`,
+`drain_events(&mut Vec<Event>) -> usize`). The `Action`/`Event` types live in
+the [`chat-model`](chat-model) crate. The `msgtui` binary in `tui/src/bin/`
+wires the TUI to [`msgclient`](#msgclient--the-channel-client) through
+`tui_client.rs` — the adapter that implements `ChatClient` for the channel
+client.
 
-`msgtui` vendors the patched `term_render` / `term_render_macros` crates under
-`tui/vendor/` (their manifests set `doctest = false` because the vendored doc
-examples don't compile unmodified). The `msgtui` lib itself has no knowledge of
-the wire protocol — only the `msgtui` binary ties the two together through
-`tui_client.rs`.
+The frontend is split into `state` (model, event folding, input state) and
+`render` (drawing), both unit-tested; the render tests drive ratatui's
+`TestBackend` so layout regressions are caught without a terminal. The `msgtui`
+lib itself has no knowledge of the wire protocol — only the `msgtui` binary ties
+the two together through `tui_client.rs`.
+
+Conversations are keyed by id in a hash map rather than scanned in a vector, so
+an inbound message is O(1) regardless of how many conversations the user
+belongs to. Transcripts are capped per conversation and composer history is
+capped overall, so a long session cannot grow without limit.
 
 ## Configuration & Operation
 
@@ -328,7 +340,7 @@ storage/     redb-backed persistent store, background-thread offload
 server/      msgd binary — wires everything together (benches/ under this)
 client/      msgclient — channel-based client (send Actions, poll Events)
 chat-model/  shared Action/Event types used by the client and TUI
-tui/         msgtui — protocol-agnostic term_render frontend + launcher bin
+tui/         msgtui — protocol-agnostic ratatui frontend + launcher bin
   ├── lib.rs      the ChatClient trait + app (no wire knowledge)
   └── bin/        msgtui binary: connects via msgclient, adapts it to the TUI
 ```
