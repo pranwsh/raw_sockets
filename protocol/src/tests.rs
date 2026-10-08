@@ -229,6 +229,31 @@ fn payload_round_trips() {
     assert_eq!(ConvEntry::decode(&one.encode()).unwrap(), one);
     // an entry without its terminator is rejected
     assert!(ConvEntry::decode(b"\x09\x09\x09\x09\x09\x09\x09\x09alice,bob").is_none());
+
+    // A conversation id is 8 raw bytes and may contain the separator byte, so
+    // the listing must be parsed by offset rather than by searching for a
+    // newline. This id starts with 0x0a and used to be split in half.
+    let tricky = ConvEntry {
+        id: vec![0x0a, b'x', 0x0a, 1, 2, 3, 4, 5],
+        members: vec![b"alice".to_vec(), b"bob".to_vec()],
+    };
+    let listing = ConvsRespBody { convs: vec![tricky.clone()] };
+    assert_eq!(
+        ConvsRespBody::decode(&listing.encode()).unwrap().convs,
+        vec![tricky.clone()],
+        "an id containing the separator must survive"
+    );
+
+    // two records back to back, the first id full of separator bytes
+    let two = ConvsRespBody {
+        convs: vec![tricky.clone(), ConvEntry { id: vec![9u8; 8], members: vec![b"carol".to_vec()] }],
+    };
+    assert_eq!(ConvsRespBody::decode(&two.encode()).unwrap(), two);
+
+    // an id containing a comma must not confuse the member split either
+    let comma = ConvEntry { id: vec![b',', 1, 2, 3, 4, 5, 6, 7], members: vec![b"d".to_vec()] };
+    let one = ConvsRespBody { convs: vec![comma.clone()] };
+    assert_eq!(ConvsRespBody::decode(&one.encode()).unwrap().convs, vec![comma]);
     // a record too short to hold an id is rejected outright
     assert!(ConvsRespBody::decode(b"short").is_none());
 

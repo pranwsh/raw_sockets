@@ -344,13 +344,17 @@ pub struct ConvEntry {
     pub members: Vec<Vec<u8>>,
 }
 
+/// width of the conversation id on the wire
+const CONV_ID_LEN: usize = 8;
+
 impl ConvEntry {
     /// append this entry's wire form to `out`
     fn encode_into(&self, out: &mut Vec<u8>) {
+        debug_assert_eq!(self.id.len(), CONV_ID_LEN, "conversation id must be 8 bytes");
         out.extend_from_slice(&self.id);
         out.extend_from_slice(&CreateConvReq { members: self.members.clone() }.encode());
-        // terminate each entry: the id is fixed width, so a trailing separator
-        // makes the record self-delimiting without a length prefix
+        // terminate each entry: the member list runs to the separator, so the
+        // record is self-delimiting without a length prefix
         out.push(b'\n');
     }
 }
@@ -369,7 +373,26 @@ impl Payload for ConvEntry {
 }
 
 impl ConvEntry {
-    /// decode one record whose trailing separator has already been stripped
+    /// Decode the record starting at the front of `record`, returning it
+    /// together with how many bytes it consumed.
+    ///
+    /// `record` may contain trailing bytes from the next record, so the parse
+    /// is driven by structure rather than by searching for a separator.
+    fn decode_prefix(record: &[u8]) -> Option<(Self, usize)> {
+        // the id is fixed width; the member list runs to the next separator
+        let (id, rest) = record.split_at_checked(CONV_ID_LEN)?;
+        let end = rest.iter().position(|&b| b == b'\n')?;
+        let members_raw = &rest[..end];
+        let members: Vec<Vec<u8>> = members_raw
+            .split(|&b| b == b',')
+            .filter(|m| !m.is_empty())
+            .map(|m| m.to_vec())
+            .collect();
+        let used = CONV_ID_LEN + end + 1;
+        Some((ConvEntry { id: id.to_vec(), members }, used))
+    }
+
+    /// decode a standalone record: an id, a member list, and its separator
     fn decode_record(record: &[u8]) -> Option<Self> {
         // the id is fixed width, so the remainder of the record is the members
         let (id, members_raw) = record.split_at(8);
@@ -391,16 +414,16 @@ impl Payload for ConvsRespBody {
         body
     }
     fn decode(body: &[u8]) -> Option<Self> {
+        // Walk the body with a fixed offset rather than splitting on the
+        // separator: the id is 8 raw bytes and may itself contain `0x0a`, so
+        // searching for the first newline would cut a record in half and
+        // corrupt both the id and the member list.
         let mut convs = Vec::new();
-        for entry in body.split(|&b| b == b'\n') {
-            // the trailing separator yields one empty final chunk; skip it
-            if entry.is_empty() {
-                continue;
-            }
-            if entry.len() < 8 {
-                return None;
-            }
-            convs.push(ConvEntry::decode_record(entry)?);
+        let mut pos = 0usize;
+        while pos < body.len() {
+            let (entry, used) = ConvEntry::decode_prefix(&body[pos..])?;
+            pos += used;
+            convs.push(entry);
         }
         Some(ConvsRespBody { convs })
     }
