@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddrV4;
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 
 // EventHandler trait — separates i/o from application logic
 
@@ -30,7 +31,7 @@ pub trait EventHandler {
     fn tick(&mut self) {}
 
     /// drain any outgoing frames queued by the handler into the provided buffer
-    fn drain_outbound(&mut self, _out: &mut Vec<(ConnectionId, Box<[u8]>)>) {}
+    fn drain_outbound(&mut self, _out: &mut Vec<(ConnectionId, Arc<[u8]>)>) {}
 
     /// drain any connection teardowns requested by the handler into the provided buffer
     fn drain_teardowns(&mut self, _out: &mut Vec<(ConnectionId, TeardownReason)>) {}
@@ -57,7 +58,7 @@ pub struct Reactor<H: EventHandler> {
     /// reusable epoll event array
     events: Vec<libc::epoll_event>,
     /// reusable buffer for outbound frames drained from the handler
-    outbound_buf: Vec<(ConnectionId, Box<[u8]>)>,
+    outbound_buf: Vec<(ConnectionId, Arc<[u8]>)>,
     /// reusable buffer for teardown requests drained from the handler
     teardown_buf: Vec<(ConnectionId, TeardownReason)>,
     /// reusable buffer for decoded frames from a single read iteration

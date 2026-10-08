@@ -13,7 +13,7 @@ use transport::{ConnectionId, EventHandler, TeardownReason};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::SocketAddrV4;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 pub const USER_ID_MAX_LEN: usize = 256;
@@ -70,7 +70,10 @@ pub struct Domain {
     /// right after a server restart).
     conversations: HashMap<Vec<u8>, Vec<Vec<u8>>>,
     /// frames queued for the reactor to send
-    outbound: Vec<(ConnectionId, Box<[u8]>)>,
+    ///
+    /// Shared frames let one sealed frame serve every recipient of a
+    /// conversation instead of being rebuilt per connection.
+    outbound: Vec<(ConnectionId, Arc<[u8]>)>,
     /// teardown requests queued for the reactor
     teardowns: Vec<(ConnectionId, TeardownReason)>,
     /// in-flight async storage operations
@@ -92,8 +95,17 @@ impl Domain {
     }
 
     fn enqueue(&mut self, id: ConnectionId, msg_type: MsgType, body: &[u8]) {
-        let frame = protocol::encode(msg_type, 0, body);
+        let frame: Arc<[u8]> = protocol::encode(msg_type, 0, body).into();
         self.outbound.push((id, frame));
+    }
+
+    /// seal `body` once into a frame that can be handed to every recipient
+    fn seal_shared(&self, msg_type: MsgType, body: &[u8]) -> Arc<[u8]> {
+        let total = protocol::frame_len(body.len());
+        let mut buf = vec![0u8; total].into_boxed_slice();
+        buf[protocol::HEADER_LEN..protocol::HEADER_LEN + body.len()].copy_from_slice(body);
+        protocol::seal(&mut buf, msg_type, 0, body.len());
+        Arc::from(buf)
     }
 
     // auth
@@ -289,16 +301,6 @@ impl Domain {
         });
     }
 
-    /// deliver a pre-built delivery `Send` body to one connection
-    fn deliver_to_connection(&mut self, id: ConnectionId, body: &[u8]) {
-        let body_len = body.len();
-        let total = protocol::HEADER_LEN + body_len + protocol::TRAILER_LEN;
-        let mut buf = vec![0u8; total].into_boxed_slice();
-        buf[protocol::HEADER_LEN..protocol::HEADER_LEN + body_len].copy_from_slice(body);
-        protocol::seal(&mut buf, MsgType::Send, 0, body_len);
-        self.outbound.push((id, buf));
-    }
-
     fn is_member(members: &[Vec<u8>], user: &[u8]) -> bool {
         members.iter().any(|m| m.as_slice() == user)
     }
@@ -460,13 +462,20 @@ impl Domain {
                     sender: session.user_id.clone(),
                     text: msg_body,
                 }.encode();
+                // Seal the delivery frame once and share it across every
+                // recipient: previously the header and CRC were recomputed for
+                // each connection, so cost scaled with members times
+                // connections and the checksum was the dominant term.
+                let frame = self.seal_shared(MsgType::Send, &delivery);
                 for member in &members {
                     if member != &session.user_id
                         && let Some(conns) = self.user_connections.get(member)
                     {
+                        // clone the id list so the borrow on `self` ends before
+                        // we push onto the outbound queue
                         let targets: Vec<ConnectionId> = conns.clone();
                         for target_id in targets {
-                            self.deliver_to_connection(target_id, &delivery);
+                            self.outbound.push((target_id, Arc::clone(&frame)));
                         }
                     }
                 }
@@ -504,7 +513,8 @@ impl Domain {
             // inbox flush after auth: deliver each stored delivery body, then delete it
             (PendingKind::InboxFetch, StoreResult::InboxRange(Ok(items))) => {
                 for (key, data) in &items {
-                    self.deliver_to_connection(conn_id, data);
+                    let frame = self.seal_shared(MsgType::Send, data);
+                    self.outbound.push((conn_id, frame));
                     let _ = self.store.delete_inbox_async(key);
                 }
             }
@@ -557,7 +567,7 @@ impl EventHandler for Domain {
         self.tick();
     }
 
-    fn drain_outbound(&mut self, out: &mut Vec<(ConnectionId, Box<[u8]>)>) {
+    fn drain_outbound(&mut self, out: &mut Vec<(ConnectionId, Arc<[u8]>)>) {
         out.append(&mut self.outbound);
     }
 

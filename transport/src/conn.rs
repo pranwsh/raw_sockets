@@ -6,6 +6,7 @@ use crate::sys;
 use protocol::{self, Decode, DecodeError, OwnedFrame};
 use std::io;
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 
 // constants — these should be tuned by benchmark; values below are conservative starting points
 
@@ -307,14 +308,20 @@ impl Connection {
 // TeardownReason → farewell frame
 
 impl TeardownReason {
-    fn farewell_frame(self) -> Box<[u8]> {
-        match self {
-            TeardownReason::ClientGoodbye => protocol::encode(protocol::MsgType::Goodbye, 0, &[]),
-            TeardownReason::ProtocolViolation => protocol::encode(protocol::MsgType::Error, 0, b"proto_error"),
-            TeardownReason::PeerClosed => protocol::encode(protocol::MsgType::Error, 0, b"peer_closed"),
-            TeardownReason::SlowClient => protocol::encode(protocol::MsgType::Error, 0, b"slow_client"),
-            TeardownReason::Shutdown => protocol::encode(protocol::MsgType::Error, 0, b"shutdown"),
-        }
+    fn farewell_frame(self) -> Arc<[u8]> {
+        let body: &[u8] = match self {
+            TeardownReason::ClientGoodbye => &[],
+            TeardownReason::ProtocolViolation => b"proto_error",
+            TeardownReason::PeerClosed => b"peer_closed",
+            TeardownReason::SlowClient => b"slow_client",
+            TeardownReason::Shutdown => b"shutdown",
+        };
+        let msg_type = if self == TeardownReason::ClientGoodbye {
+            protocol::MsgType::Goodbye
+        } else {
+            protocol::MsgType::Error
+        };
+        protocol::encode(msg_type, 0, body).into()
     }
 }
 
