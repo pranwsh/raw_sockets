@@ -212,8 +212,16 @@ fn payload_round_trips() {
     };
     assert_eq!(Delivery::decode(&delivery.encode()).unwrap(), delivery);
 
-    let convs = ConvsRespBody { ids: vec![vec![1u8; 8], vec![2u8; 8]] };
+    let convs = ConvsRespBody {
+        convs: vec![
+            ConvEntry { id: vec![1u8; 8], members: vec![b"alice".to_vec(), b"bob".to_vec()] },
+            ConvEntry { id: vec![2u8; 8], members: vec![b"carol".to_vec()] },
+        ],
+    };
     assert_eq!(ConvsRespBody::decode(&convs.encode()).unwrap(), convs);
+    // an empty listing round-trips as an empty list
+    let none = ConvsRespBody { convs: vec![] };
+    assert_eq!(ConvsRespBody::decode(&none.encode()).unwrap(), none);
 
     let aok = AuthOkBody { created: true };
     assert_eq!(AuthOkBody::decode(&aok.encode()).unwrap(), aok);

@@ -26,15 +26,18 @@ fn two_clients_exchange_messages() {
 
     // alice creates a conversation with bob (the client auto-prepends "alice")
     alice.send(Action::CreateConv { members: vec!["bob".into()] });
-    let conv = match wait_for(&alice, |e| matches!(e, Event::ConvCreated { .. })) {
-        Event::ConvCreated { id } => id,
+    let conv = match wait_for(&alice, |e| matches!(e, Event::ConvCreated(..))) {
+        Event::ConvCreated(info) => info.id,
         other => panic!("expected ConvCreated, got {other:?}"),
     };
 
     // alice lists conversations — the new one must be present
     alice.send(Action::ListConvs);
     match wait_for(&alice, |e| matches!(e, Event::Convs { .. })) {
-        Event::Convs { ids } => assert!(ids.contains(&conv), "conv missing from list"),
+        Event::Convs { convs } => {
+            let ids: Vec<Vec<u8>> = convs.into_iter().map(|c| c.id).collect();
+            assert!(ids.contains(&conv), "conv missing from list");
+        }
         other => panic!("expected Convs, got {other:?}"),
     }
 
@@ -85,8 +88,8 @@ fn double_hello_does_not_duplicate_delivery() {
     assert_auth_ok(&bob);
 
     alice.send(Action::CreateConv { members: vec!["bob".into()] });
-    let conv = match wait_for(&alice, |e| matches!(e, Event::ConvCreated { .. })) {
-        Event::ConvCreated { id } => id,
+    let conv = match wait_for(&alice, |e| matches!(e, Event::ConvCreated(..))) {
+        Event::ConvCreated(info) => info.id,
         other => panic!("expected ConvCreated, got {other:?}"),
     };
 

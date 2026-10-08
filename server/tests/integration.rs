@@ -44,26 +44,77 @@ impl Drop for ServerGuard {
 
 /// spawn a msgd instance on a random port
 fn spawn_server() -> (ServerGuard, SocketAddr) {
-    let port = portpicker();
-    let data_path = format!("/tmp/msgd_test_{}", port);
-    let bind = format!("127.0.0.1:{}", port);
+    // Retry across a few ports: between picking a port and the server binding
+    // it, anything else on the box (including a sibling test running in
+    // parallel) can take it. `msgd` sets SO_REUSEPORT, so a lost race does
+    // not fail loudly -- two servers end up silently sharing the port and its
+    // redb file, and the test then talks to whichever one the kernel picks.
+    // Detecting that requires retrying, so give it a few attempts.
+    let mut last_err = String::new();
+    for _ in 0..8 {
+        let port = portpicker();
+        let data_path = format!("/tmp/msgd_test_{}", port);
+        let bind = format!("127.0.0.1:{port}");
+        let addr: SocketAddr = bind.parse().unwrap();
 
-    let child = Command::new(server_bin())
-        .arg("--bind")
-        .arg(&bind)
-        .arg("--data")
-        .arg(&data_path)
-        .spawn()
-        .expect("failed to spawn msgd");
+        let child = match Command::new(server_bin())
+            .arg("--bind")
+            .arg(&bind)
+            .arg("--data")
+            .arg(&data_path)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = format!("spawn failed: {e}");
+                continue;
+            }
+        };
 
-    let addr: SocketAddr = bind.parse().unwrap();
-    (ServerGuard::new(child), addr)
+        let guard = ServerGuard::new(child);
+        if wait_until_accepting(addr) {
+            return (guard, addr);
+        }
+        // the server exited or never came up on this port: drop the guard so
+        // the fd is released, then try another port
+        last_err = format!("server never accepted on port {port}");
+        drop(guard);
+        let _ = std::fs::remove_file(&data_path);
+    }
+    panic!("failed to start msgd after several attempts: {last_err}");
 }
 
+/// Wait until the server is actually accepting connections on `addr`.
+fn wait_until_accepting(addr: SocketAddr) -> bool {
+    let deadline = Instant::now() + START_TIMEOUT;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(addr).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
+/// Pick a free TCP port that no other test in this process has taken.
+///
+/// The listener is closed before returning, so a race with an unrelated
+/// process is still possible; `spawn_server` retries to cover it. Tracking the
+/// ports we already handed out removes the collision between tests running in
+/// parallel in this same binary, which is the common case.
 fn portpicker() -> u16 {
-    // bind to port 0, get the assigned port, close
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    static TAKEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    for _ in 0..64 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        if TAKEN.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
+    panic!("could not find a free port");
 }
 
 /// a thin client that sends/receives frames over a TCP stream

@@ -19,8 +19,8 @@ fn send_to_deliver_latency() {
     wait_for_poll(&bob, |e| matches!(e, Event::AuthOk { .. }), Duration::from_millis(1));
 
     alice.send(Action::CreateConv { members: vec!["bob".into()] });
-    let conv = match wait_for_poll(&alice, |e| matches!(e, Event::ConvCreated { .. }), Duration::from_millis(1)) {
-        Event::ConvCreated { id } => id,
+    let conv = match wait_for_poll(&alice, |e| matches!(e, Event::ConvCreated(..)), Duration::from_millis(1)) {
+        Event::ConvCreated(info) => info.id,
         other => panic!("expected ConvCreated, got {other:?}"),
     };
 

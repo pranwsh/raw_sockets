@@ -23,8 +23,8 @@ fn idle_client_is_not_disconnected() {
 
     // alice creates the conversation so both know the conv id
     alice.send(Action::CreateConv { members: vec!["bob".into()] });
-    let conv = match wait_for(&alice, |e| matches!(e, Event::ConvCreated { .. })) {
-        Event::ConvCreated { id } => id,
+    let conv = match wait_for(&alice, |e| matches!(e, Event::ConvCreated(..))) {
+        Event::ConvCreated(info) => info.id,
         other => panic!("expected ConvCreated, got {other:?}"),
     };
 

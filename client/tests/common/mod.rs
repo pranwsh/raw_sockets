@@ -38,22 +38,50 @@ impl Drop for Server {
     }
 }
 
+/// Start a server, retrying across ports until one actually comes up.
+///
+/// Picking a port and binding it are separate steps, so between them another
+/// test binary (these run in parallel across the workspace) can take the same
+/// port. `msgd` sets `SO_REUSEPORT`, so a lost race does not fail loudly --
+/// two servers silently share the port and its redb file, and the client then
+/// talks to whichever one the kernel picks. The only reliable signal is
+/// connecting, so retry on a fresh port until that succeeds.
 pub fn start_server() -> Server {
-    let port = free_port();
-    let data = std::env::temp_dir().join(format!("msgclient_it_{}_{}.redb", std::process::id(), port));
-    let _ = std::fs::remove_file(&data);
-    let child = Command::new(server_bin())
-        .args([
-            "--bind",
-            &format!("127.0.0.1:{port}"),
-            "--data",
-            data.to_str().unwrap(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn msgd server");
-    Server { child, port }
+    let mut last = String::new();
+    for _ in 0..8 {
+        let port = free_port();
+        let data = std::env::temp_dir()
+            .join(format!("msgclient_it_{}_{}.redb", std::process::id(), port));
+        let _ = std::fs::remove_file(&data);
+        let child = Command::new(server_bin())
+            .args(["--bind", &format!("127.0.0.1:{port}"), "--data", data.to_str().unwrap()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn msgd server");
+
+        let srv = Server { child, port };
+        if wait_until_accepting(port) {
+            return srv;
+        }
+        last = format!("server never accepted on port {port}");
+        // drop `srv` so the process and its fd are released before retrying
+        drop(srv);
+        let _ = std::fs::remove_file(&data);
+    }
+    panic!("failed to start msgd after several attempts: {last}");
+}
+
+/// wait until the server accepts a TCP connection on `port`
+fn wait_until_accepting(port: u16) -> bool {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    false
 }
 
 pub fn connect_with_retry(port: u16) -> Client {
