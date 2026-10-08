@@ -363,14 +363,18 @@ fn submit_composer(client: &dyn ChatClient, state: &mut State) -> bool {
 // --- filter overlay
 
 fn handle_filter_key(state: &mut State, key: KeyEvent) -> bool {
+    // every edit goes through `set_filter` so the cached visible list is
+    // invalidated exactly once, here
     match key.code {
         CtKey::Esc => {
             state.overlay = Overlay::None;
-            state.filter.clear();
+            state.set_filter(String::new());
             state.dirty = true;
         }
         CtKey::Backspace => {
-            state.filter.pop();
+            let mut f = state.filter.clone();
+            f.pop();
+            state.set_filter(f);
             state.dirty = true;
         }
         CtKey::Enter => {
@@ -379,7 +383,9 @@ fn handle_filter_key(state: &mut State, key: KeyEvent) -> bool {
             state.dirty = true;
         }
         CtKey::Char(c) => {
-            state.filter.push(c);
+            let mut f = state.filter.clone();
+            f.push(c);
+            state.set_filter(f);
             state.dirty = true;
         }
         _ => {}

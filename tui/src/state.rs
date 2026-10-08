@@ -194,6 +194,16 @@ pub struct State {
     /// side panel hidden (full-screen transcript)
     pub wide: bool,
 
+    /// cached result of [`State::visible`], rebuilt only when `filter_cache`
+    /// no longer matches `filter` or `filter_epoch`
+    visible_cache: Vec<usize>,
+    /// the filter text `visible_cache` was built for
+    filter_cache: String,
+    /// conversation revision `visible_cache` was built against
+    filter_epoch: u64,
+    /// bumped whenever a conversation is added or its searchable text changes
+    filter_epoch_counter: u64,
+
     /// true when something changed and a redraw is worthwhile
     pub dirty: bool,
     /// number of frames drawn, for diagnostics
@@ -235,6 +245,10 @@ impl State {
             login_pass: String::new(),
             login_field: LoginField::User,
             draft_members: String::new(),
+            visible_cache: Vec::new(),
+            filter_cache: String::new(),
+            filter_epoch: u64::MAX,
+            filter_epoch_counter: 0,
             status: None,
             wide: false,
             dirty: true,
@@ -251,6 +265,8 @@ impl State {
                 let cur = &self.entries[i].members;
                 if !cur.is_empty() && cur != m {
                     self.entries[i].members = m.to_vec();
+                    // the label feeds the filter, so the cache is now stale
+                    self.touch_filter();
                 }
             }
             return i;
@@ -260,6 +276,7 @@ impl State {
         self.entries.push(Conversation::new(&info));
         self.convs.insert(id.to_vec(), idx);
         self.order.push(idx);
+        self.touch_filter();
         idx
     }
 
@@ -269,27 +286,44 @@ impl State {
     }
 
     /// the conversation the sidebar cursor is on
-    pub fn cursor_conv(&self) -> Option<&Conversation> {
-        self.visible().get(self.cursor).and_then(|i| self.entries.get(*i))
+    pub fn cursor_conv(&mut self) -> Option<&Conversation> {
+        let cursor = self.cursor;
+        let i = *self.visible().get(cursor)?;
+        self.entries.get(i)
+    }
+
+    /// Mark the cached filter result stale.
+    fn touch_filter(&mut self) {
+        self.filter_epoch_counter = self.filter_epoch_counter.wrapping_add(1);
     }
 
     /// sidebar entries matching the current filter, in display order
-    pub fn visible(&self) -> Vec<usize> {
-        if self.filter.is_empty() {
-            return self.order.clone();
+    ///
+    /// The result is cached and rebuilt only when the filter text or the set of
+    /// conversations changes. The sidebar redraws on every keystroke and every
+    /// inbound message, and recomputing the scan (plus the label building and
+    /// lowercasing it needs) each time would dominate the frame.
+    pub fn visible(&mut self) -> &[usize] {
+        if self.filter_cache == self.filter && self.filter_epoch == self.filter_epoch_counter {
+            return &self.visible_cache;
         }
-        let needle = self.filter.to_lowercase();
-        self.order
-            .iter()
-            .copied()
-            .filter(|&i| {
+        self.visible_cache.clear();
+        if self.filter.is_empty() {
+            self.visible_cache.extend_from_slice(&self.order);
+        } else {
+            let needle = self.filter.to_lowercase();
+            self.visible_cache.extend(self.order.iter().copied().filter(|&i| {
                 let c = &self.entries[i];
                 let label = c.label(&self.me).to_lowercase();
                 label.contains(&needle)
                     || c.last_text.to_lowercase().contains(&needle)
                     || crate::util::hex_prefix(&c.id).contains(&needle)
-            })
-            .collect()
+            }));
+        }
+        self.filter_cache.clear();
+        self.filter_cache.push_str(&self.filter);
+        self.filter_epoch = self.filter_epoch_counter;
+        &self.visible_cache
     }
 
     /// display label for a conversation index
@@ -333,14 +367,20 @@ impl State {
         self.dirty = true;
     }
 
+    /// the conversation the sidebar cursor is on, by backing index
+    pub fn cursor_index(&mut self) -> Option<usize> {
+        let cursor = self.cursor;
+        self.visible().get(cursor).copied()
+    }
+
     /// open the conversation under the cursor
     pub fn open_cursor(&mut self) {
-        let vis = self.visible();
-        if let Some(&i) = vis.get(self.cursor) {
+        if let Some(i) = self.cursor_index() {
             self.select(i);
             self.focus = Focus::Composer;
         }
     }
+
 
     /// scroll the transcript by `delta` lines; 0 is the newest message
     pub fn scroll_by(&mut self, delta: usize) {
@@ -425,6 +465,8 @@ impl State {
                     &self.me,
                     !is_selected,
                 );
+                // the preview text feeds the sidebar filter, so the cache is stale
+                self.touch_filter();
                 // jump to a conversation that just received a message so
                 // inbound traffic is immediately visible
                 if self.selected.is_none() {
@@ -473,6 +515,14 @@ impl State {
         self.entries.len()
     }
 
+    /// set the sidebar filter, invalidating the cached visible list
+    pub fn set_filter(&mut self, filter: String) {
+        if self.filter != filter {
+            self.filter = filter;
+            self.touch_filter();
+        }
+    }
+
     /// whether conversation `idx` is the one shown in the transcript
     pub fn is_selected(&self, idx: usize) -> bool {
         self.selected == Some(idx)
@@ -515,8 +565,7 @@ impl State {
     /// Arrowing through the sidebar previews each conversation, so the user can
     /// see what they are about to open.
     pub fn open_cursor_soft(&mut self) {
-        let vis = self.visible();
-        if let Some(&i) = vis.get(self.cursor) {
+        if let Some(i) = self.cursor_index() {
             if self.selected != Some(i) {
                 self.selected = Some(i);
                 self.scroll = 0;
@@ -752,19 +801,19 @@ mod tests {
         s.apply(msg(&[2u8; 8], "carol", "about penguins"));
 
         // by member name
-        s.filter = "carol".into();
+        s.set_filter("carol".into());
         assert_eq!(s.visible(), vec![1]);
         // by message preview
-        s.filter = "penguins".into();
+        s.set_filter("penguins".into());
         assert_eq!(s.visible(), vec![1]);
         // by hex id
-        s.filter = "0101".into();
+        s.set_filter("0101".into());
         assert_eq!(s.visible(), vec![0]);
         // case insensitive
-        s.filter = "CAROL".into();
+        s.set_filter("CAROL".into());
         assert_eq!(s.visible(), vec![1]);
         // no match
-        s.filter = "zzz".into();
+        s.set_filter("zzz".into());
         assert!(s.visible().is_empty());
     }
 
@@ -835,5 +884,68 @@ mod tests {
         assert_eq!(s.cursor_on_row(), 0);
         s.move_cursor(-1);
         assert_eq!(s.cursor_on_row(), 1);
+    }
+}
+
+#[cfg(test)]
+mod filter_cache_tests {
+    use super::*;
+    use chat_model::Event;
+
+    fn with_two() -> State {
+        let mut s = State::new();
+        s.me = "alice".into();
+        s.apply(Event::Convs {
+            convs: vec![
+                ConvInfo { id: vec![1u8; 8], members: vec!["alice".into(), "bob".into()] },
+                ConvInfo { id: vec![2u8; 8], members: vec!["alice".into(), "carol".into()] },
+            ],
+        });
+        s
+    }
+
+    #[test]
+    fn cache_tracks_filter_edits() {
+        let mut s = with_two();
+        assert_eq!(s.visible().len(), 2);
+        s.set_filter("carol".into());
+        assert_eq!(s.visible().to_vec(), vec![1]);
+        s.set_filter(String::new());
+        assert_eq!(s.visible().len(), 2);
+    }
+
+    #[test]
+    fn cache_invalidated_when_a_conversation_arrives() {
+        let mut s = with_two();
+        s.set_filter("dave".into());
+        assert!(s.visible().is_empty());
+        // a new conversation whose members match must show up immediately
+        s.apply(Event::Convs {
+            convs: vec![ConvInfo { id: vec![3u8; 8], members: vec!["alice".into(), "dave".into()] }],
+        });
+        assert_eq!(s.visible().to_vec(), vec![2]);
+    }
+
+    #[test]
+    fn cache_invalidated_when_a_message_changes_the_preview() {
+        let mut s = with_two();
+        s.set_filter("penguins".into());
+        assert!(s.visible().is_empty());
+        // the preview text is searchable, so a new message must invalidate
+        s.apply(Event::Message {
+            conv: vec![1u8; 8],
+            from: "bob".into(),
+            seq: 1,
+            text: "we should discuss penguins".into(),
+        });
+        assert_eq!(s.visible().to_vec(), vec![0]);
+    }
+
+    #[test]
+    fn cache_is_consistent_across_repeated_reads() {
+        let mut s = with_two();
+        let a = s.visible().to_vec();
+        let b = s.visible().to_vec();
+        assert_eq!(a, b, "a cached read must not change the result");
     }
 }

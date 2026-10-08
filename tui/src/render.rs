@@ -68,7 +68,9 @@ pub fn draw(frame: &mut Frame, state: &mut State, epoch_base: std::time::Instant
 
 /// Draw the conversation list.
 fn draw_sidebar(frame: &mut Frame, state: &mut State, area: Rect) {
-    let visible = state.visible();
+    // Copy the (small) visible index list out of the cache so the rest of the
+    // function can read `state` freely.
+    let visible: Vec<usize> = state.visible().to_vec();
     // clamp the cursor into range after a filter shrinks the list
     state.clamp_cursor(visible.len());
 
