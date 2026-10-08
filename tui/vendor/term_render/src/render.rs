@@ -969,9 +969,9 @@ impl Window {
             let closure = move || {  // top
                 let mut text = String::new();
                 text.push_str(&color.0);
-                text.push('└');
+                text.push('╰');
                 text.push_str(&"─".repeat(window_size.saturating_sub(2) as usize));
-                text.push('┘');
+                text.push('╯');
                 text.push_str(CLEAR);
                 text
             };
@@ -984,14 +984,14 @@ impl Window {
             let closure = move || {
                 let mut text = String::new();
                 text.push_str(&color.0);
-                text.push('┌');
+                text.push('╭');
                 let half = (window_size as usize / 2).saturating_sub(title.1 / 2).saturating_sub(1);
                 text.push_str(&"─".repeat(half));
                 text.push_str(CLEAR);
                 text.push_str(&title.0.join().0);
                 text.push_str(&color.0);
                 text.push_str(&"─".repeat((window_size as usize).saturating_sub(2 + half + title.1)));
-                text.push('┐');
+                text.push('╮');
                 text.push_str(CLEAR);
                 text
             };
@@ -1020,7 +1020,7 @@ impl Window {
             if self.bordered {
                 let mut line_size = 1;
                 text[0].push_str(&color.0);
-                text[0].push('┌');
+                text[0].push('╭');
                 let split_size = (self.size.0 - 2) / 2 - self.title.1 as u16 / 2;
                 line_size += split_size;
                 text[0].push_str(&"─".repeat(split_size as usize));
@@ -1030,7 +1030,7 @@ impl Window {
                 text[0].push_str(&"─".repeat(
                     (self.size.0 as usize).saturating_sub(1 + line_size as usize)
                 ));
-                text[0].push('┐');
+                text[0].push('╮');
                 text[0].push_str(CLEAR);
                 //text[0].push('\n');  // fix this
                 text.push(String::new());
@@ -1076,9 +1076,9 @@ impl Window {
         let last_index = text.len() - 1;
         if self.bordered {
             text[last_index].push_str(&color.0);
-            text[last_index].push('└');
+            text[last_index].push('╰');
             text[last_index].push_str(&"─".repeat(self.size.0 as usize - 2));
-            text[last_index].push('┘');
+            text[last_index].push('╯');
             text[last_index].push_str(CLEAR);
         } else {
             // removing the last \n
@@ -1507,10 +1507,11 @@ impl App {
             for call in draw_calls {
                 // moving the cursor into position
                 // ESC[{line};{column}H
+                // the coordinates are 1-based, while the internal positions are 0-based
                 write_buffer.push_str("\x1b[");
-                App::push_u16(write_buffer, call.2);
+                App::push_u16(write_buffer, call.2 + 1);
                 write_buffer.push(';');
-                App::push_u16(write_buffer, call.1);
+                App::push_u16(write_buffer, call.1 + 1);
                 write_buffer.push('H');
 
                 let output = call.0();

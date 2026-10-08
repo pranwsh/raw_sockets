@@ -24,9 +24,38 @@ pub const TYPE_MASK: u16 = 0x1FFF;
 // message types
 
 /// all message types share one frame envelope
-#[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MsgType {
+///
+/// The single source of truth for wire ids: the [`msg_types!`] registry below
+/// generates the enum, the numeric mapping (`from_u16`/`as_u16`) and the full
+/// variant list (`ALL`) from one table, so they can never desync. Adding a
+/// message type = add one line to the [`msg_types!`] invocation.
+macro_rules! msg_types {
+    ($( $name:ident = $num:literal ),+ $(,)?) => {
+        #[repr(u16)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum MsgType {
+            $( $name = $num, )*
+        }
+
+        impl MsgType {
+            /// every declared message type, in declaration order
+            pub const ALL: &'static [MsgType] = &[ $( Self::$name, )* ];
+
+            pub const fn from_u16(v: u16) -> Option<Self> {
+                $( if v == $num { return Some(Self::$name); } )*
+                None
+            }
+
+            pub const fn as_u16(self) -> u16 {
+                match self {
+                    $( Self::$name => $num, )*
+                }
+            }
+        }
+    };
+}
+
+msg_types![
     // handshake / auth
     Hello = 1,
     AuthOk = 4,
@@ -52,29 +81,7 @@ pub enum MsgType {
     Ping = 90,
     Pong = 91,
     Error = 99,
-}
-
-impl MsgType {
-    pub fn from_u16(v: u16) -> Option<Self> {
-        Some(match v {
-            1 => Self::Hello,
-            4 => Self::AuthOk,
-            5 => Self::AuthFail,
-            6 => Self::Goodbye,
-            10 => Self::Presence,
-            20 => Self::CreateConv,
-            21 => Self::ConvCreated,
-            30 => Self::Send,
-            31 => Self::Delivered,
-            37 => Self::ListConvs,
-            38 => Self::ConvsResp,
-            90 => Self::Ping,
-            91 => Self::Pong,
-            99 => Self::Error,
-            _ => return None,
-        })
-    }
-}
+];
 
 // frame
 
@@ -139,7 +146,7 @@ pub fn encode_into(dst: &mut [u8], msg_type: MsgType, flags: u16, body: &[u8]) -
 
     dst[0] = MAGIC;
     dst[1] = VERSION;
-    let tf = (msg_type as u16) & TYPE_MASK | (flags & FLAG_MASK);
+    let tf = msg_type.as_u16() & TYPE_MASK | (flags & FLAG_MASK);
     dst[2..4].copy_from_slice(&tf.to_le_bytes());
     dst[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
     dst[HEADER_LEN..HEADER_LEN + body.len()].copy_from_slice(body);
@@ -163,7 +170,7 @@ pub fn seal(buf: &mut [u8], msg_type: MsgType, flags: u16, body_len: usize) -> u
     debug_assert!(buf.len() >= total);
     buf[0] = MAGIC;
     buf[1] = VERSION;
-    let tf = (msg_type as u16) & TYPE_MASK | (flags & FLAG_MASK);
+    let tf = msg_type.as_u16() & TYPE_MASK | (flags & FLAG_MASK);
     buf[2..4].copy_from_slice(&tf.to_le_bytes());
     buf[4..8].copy_from_slice(&(body_len as u32).to_le_bytes());
     let crc = crc32c(&buf[1..HEADER_LEN + body_len]);
@@ -171,69 +178,195 @@ pub fn seal(buf: &mut [u8], msg_type: MsgType, flags: u16, body_len: usize) -> u
     total
 }
 
-// wire body formats — the application-level encodings shared by the client
-// and server so the layouts live in exactly one place
+// wire body formats — typed codecs
+//
+// Each message's body layout lives in exactly one [`Payload`] implementation.
+// The layouts are documented in PROTOCOL.md; these impls are the authoritative
+// in-code definition shared by the client, server and tests.
 
-/// body of a `Hello`: `<user>\n<password>`
-pub fn hello_body(user: &[u8], password: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(user.len() + 1 + password.len());
-    body.extend_from_slice(user);
-    body.push(b'\n');
-    body.extend_from_slice(password);
+/// a message body codec: serializes/deserializes one message type's body
+pub trait Payload: Sized {
+    fn encode(&self) -> Vec<u8>;
+    fn decode(body: &[u8]) -> Option<Self>;
+}
+
+/// empty body (Ping, Pong, ListConvs, Goodbye)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Empty;
+
+impl Payload for Empty {
+    fn encode(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        if body.is_empty() { Some(Empty) } else { None }
+    }
+}
+
+/// opaque pass-through body (Presence)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opaque(pub Vec<u8>);
+
+impl Payload for Opaque {
+    fn encode(&self) -> Vec<u8> {
+        self.0.clone()
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        Some(Opaque(body.to_vec()))
+    }
+}
+
+/// `Hello` body: `<user>\n<password>`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelloReq {
+    pub user: Vec<u8>,
+    pub password: Vec<u8>,
+}
+
+impl Payload for HelloReq {
+    fn encode(&self) -> Vec<u8> {
+        newline_join(&[&self.user, &self.password])
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        let (user, password) = split_at_newline(body)?;
+        Some(HelloReq { user: user.to_vec(), password: password.to_vec() })
+    }
+}
+
+/// `CreateConv` body: comma-separated member ids (empty segments ignored)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateConvReq {
+    pub members: Vec<Vec<u8>>,
+}
+
+impl Payload for CreateConvReq {
+    fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (i, m) in self.members.iter().enumerate() {
+            if i > 0 { body.push(b','); }
+            body.extend_from_slice(m);
+        }
+        body
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        let members: Vec<Vec<u8>> =
+            body.split(|&b| b == b',').filter(|m| !m.is_empty()).map(|m| m.to_vec()).collect();
+        Some(CreateConvReq { members })
+    }
+}
+
+/// client→server `Send` body: `<conv_id>\n<text>`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendReq {
+    pub conv: Vec<u8>,
+    pub text: Vec<u8>,
+}
+
+impl Payload for SendReq {
+    fn encode(&self) -> Vec<u8> {
+        newline_join(&[&self.conv, &self.text])
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        let (conv, text) = split_at_newline(body)?;
+        Some(SendReq { conv: conv.to_vec(), text: text.to_vec() })
+    }
+}
+
+/// server→client delivery `Send` body: `<conv_id>\n<seq:8le>\n<sender>\n<text>`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub conv: Vec<u8>,
+    pub seq: u64,
+    pub sender: Vec<u8>,
+    pub text: Vec<u8>,
+}
+
+impl Payload for Delivery {
+    fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(
+            self.conv.len() + 1 + 8 + 1 + self.sender.len() + 1 + self.text.len(),
+        );
+        body.extend_from_slice(&self.conv);
+        body.push(b'\n');
+        body.extend_from_slice(&self.seq.to_le_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(&self.sender);
+        body.push(b'\n');
+        body.extend_from_slice(&self.text);
+        body
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        let (conv, rest) = split_at_newline(body)?;
+        let seq = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
+        // skip the 8 seq bytes plus the separating `\n` to reach `<sender>\n<text>`
+        let (sender, text) = split_at_newline(&rest[9..])?;
+        Some(Delivery { conv: conv.to_vec(), seq, sender: sender.to_vec(), text: text.to_vec() })
+    }
+}
+
+/// `AuthOk` body: 1 byte — 1 if the account was just created, 0 otherwise
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthOkBody {
+    pub created: bool,
+}
+
+impl Payload for AuthOkBody {
+    fn encode(&self) -> Vec<u8> {
+        vec![if self.created { 1 } else { 0 }]
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        match body.first() {
+            Some(&0) => Some(AuthOkBody { created: false }),
+            Some(&1) => Some(AuthOkBody { created: true }),
+            _ => None,
+        }
+    }
+}
+
+/// `ConvsResp` body: concatenated 8-byte (LE) conversation ids
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvsRespBody {
+    pub ids: Vec<Vec<u8>>,
+}
+
+impl Payload for ConvsRespBody {
+    fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(self.ids.len() * 8);
+        for id in &self.ids {
+            body.extend_from_slice(id);
+        }
+        body
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        let ids: Vec<Vec<u8>> = body.chunks_exact(8).map(|c| c.to_vec()).collect();
+        Some(ConvsRespBody { ids })
+    }
+}
+
+/// `Delivered` body: 8-byte little-endian sequence number
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveredBody {
+    pub seq: u64,
+}
+
+impl Payload for DeliveredBody {
+    fn encode(&self) -> Vec<u8> {
+        self.seq.to_le_bytes().to_vec()
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        let seq = u64::from_le_bytes(body.get(..8)?.try_into().ok()?);
+        Some(DeliveredBody { seq })
+    }
+}
+
+fn newline_join(parts: &[&[u8]]) -> Vec<u8> {
+    let len = parts.iter().map(|p| p.len() + 1).sum::<usize>().saturating_sub(1);
+    let mut body = Vec::with_capacity(len);
+    for (i, p) in parts.iter().enumerate() {
+        if i > 0 { body.push(b'\n'); }
+        body.extend_from_slice(p);
+    }
     body
-}
-
-/// split a `Hello` body into (user, password)
-pub fn split_hello(body: &[u8]) -> Option<(&[u8], &[u8])> {
-    split_at_newline(body)
-}
-
-/// body of a client→server `Send`: `<conv_id>\n<text>`
-pub fn send_body(conv: &[u8], text: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(conv.len() + 1 + text.len());
-    body.extend_from_slice(conv);
-    body.push(b'\n');
-    body.extend_from_slice(text);
-    body
-}
-
-/// split a client→server `Send` body into (conv_id, text)
-pub fn split_send(body: &[u8]) -> Option<(&[u8], &[u8])> {
-    split_at_newline(body)
-}
-
-/// body of a server→client delivery `Send`:
-/// `<conv_id>\n<seq:8le>\n<sender>\n<text>`
-pub fn delivery_body(conv: &[u8], seq: u64, sender: &[u8], text: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(conv.len() + 1 + 8 + 1 + sender.len() + 1 + text.len());
-    body.extend_from_slice(conv);
-    body.push(b'\n');
-    body.extend_from_slice(&write_u64_le(seq));
-    body.push(b'\n');
-    body.extend_from_slice(sender);
-    body.push(b'\n');
-    body.extend_from_slice(text);
-    body
-}
-
-/// split a delivery body into (conv_id, seq, sender, text)
-pub type Delivery<'a> = (&'a [u8], u64, &'a [u8], &'a [u8]);
-pub fn split_delivery(body: &[u8]) -> Option<Delivery<'_>> {
-    let (conv, rest) = split_at_newline(body)?;
-    let seq = read_u64_le(rest)?;
-    // skip the 8 seq bytes plus the separating `\n` to reach `<sender>\n<text>`
-    let (sender, text) = split_at_newline(&rest[9..])?;
-    Some((conv, seq, sender, text))
-}
-
-/// 8-byte little-endian encoding of a sequence number
-pub fn write_u64_le(v: u64) -> [u8; 8] {
-    v.to_le_bytes()
-}
-
-/// decode an 8-byte little-endian u64 from the front of `b`
-pub fn read_u64_le(b: &[u8]) -> Option<u64> {
-    Some(u64::from_le_bytes(b.get(..8)?.try_into().ok()?))
 }
 
 fn split_at_newline(body: &[u8]) -> Option<(&[u8], &[u8])> {

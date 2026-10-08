@@ -7,7 +7,7 @@ use std::process::{Command, Child};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use protocol::{self, MsgType, Decode};
+use protocol::{self, HelloReq, MsgType, Payload, Decode};
 
 // helper: spawn a server instance
 
@@ -59,10 +59,7 @@ fn auth_round_trip(addr: SocketAddr) -> Duration {
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let user_id = b"bench_user";
-    let mut hello_body = Vec::new();
-    hello_body.extend_from_slice(user_id);
-    hello_body.push(b'\n');
-    hello_body.extend_from_slice(b"benchpass");
+    let hello_body = HelloReq { user: user_id.to_vec(), password: b"benchpass".to_vec() }.encode();
 
     let hello_frame = protocol::encode(MsgType::Hello, 0, &hello_body);
     let start = Instant::now();
@@ -93,10 +90,7 @@ fn ping_round_trip(addr: SocketAddr) -> Duration {
     let user_id = b"ping_bench";
 
     // authenticate first
-    let mut hello_body = Vec::new();
-    hello_body.extend_from_slice(user_id);
-    hello_body.push(b'\n');
-    hello_body.extend_from_slice(b"benchpass");
+    let hello_body = HelloReq { user: user_id.to_vec(), password: b"benchpass".to_vec() }.encode();
     let hello = protocol::encode(MsgType::Hello, 0, &hello_body);
     stream.write_all(&hello).unwrap();
     let mut buf = vec![0u8; 8192];
@@ -142,10 +136,7 @@ fn send_round_trip(addr: SocketAddr) -> Duration {
     let user_id = b"send_bench";
 
     // authenticate
-    let mut hello_body = Vec::new();
-    hello_body.extend_from_slice(user_id);
-    hello_body.push(b'\n');
-    hello_body.extend_from_slice(b"benchpass");
+    let hello_body = HelloReq { user: user_id.to_vec(), password: b"benchpass".to_vec() }.encode();
     let hello = protocol::encode(MsgType::Hello, 0, &hello_body);
     stream.write_all(&hello).unwrap();
     let mut buf = vec![0u8; 8192];

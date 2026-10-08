@@ -4,7 +4,10 @@
 
 mod sha256;
 
-use protocol::{self, MsgType, OwnedFrame};
+use protocol::{
+    self, AuthOkBody, ConvsRespBody, CreateConvReq, DeliveredBody, Delivery, HelloReq, MsgType,
+    OwnedFrame, Payload, SendReq,
+};
 use storage::{Store, StoreResult};
 use transport::{ConnectionId, EventHandler, TeardownReason};
 use std::collections::{HashMap, HashSet};
@@ -124,11 +127,11 @@ impl Domain {
     }
 
     fn handle_hello(&mut self, id: ConnectionId, body: &[u8]) {
-        let Some((user_id, password)) = protocol::split_hello(body) else {
+        let Some(HelloReq { user, password }) = HelloReq::decode(body) else {
             self.enqueue(id, MsgType::AuthFail, b"bad_hello_format");
             return;
         };
-        if user_id.is_empty() || user_id.len() > USER_ID_MAX_LEN {
+        if user.is_empty() || user.len() > USER_ID_MAX_LEN {
             self.enqueue(id, MsgType::AuthFail, b"invalid_user_id");
             return;
         }
@@ -136,7 +139,7 @@ impl Domain {
             self.enqueue(id, MsgType::AuthFail, b"invalid_password");
             return;
         }
-        let rx = match self.store.get_account_async(user_id) {
+        let rx = match self.store.get_account_async(&user) {
             Ok(rx) => rx,
             Err(e) => {
                 self.enqueue(id, MsgType::Error, format!("storage: {e}").as_bytes());
@@ -145,7 +148,7 @@ impl Domain {
         };
         self.pending_ops.push(PendingOp {
             conn_id: id,
-            kind: PendingKind::HelloLookup { user_id: user_id.to_vec(), password: password.to_vec() },
+            kind: PendingKind::HelloLookup { user_id: user, password },
             rx,
         });
     }
@@ -202,13 +205,16 @@ impl Domain {
         if self.authenticated(id).is_none() {
             return;
         }
-        let members: Vec<&[u8]> = body.split(|&b| b == b',').filter(|m| !m.is_empty()).collect();
+        let Some(CreateConvReq { members }) = CreateConvReq::decode(body) else {
+            self.enqueue(id, MsgType::Error, b"need_at_least_2_members");
+            return;
+        };
         if members.len() < 2 {
             self.enqueue(id, MsgType::Error, b"need_at_least_2_members");
             return;
         }
         let conv_id = {
-            let mut sorted: Vec<Vec<u8>> = members.iter().map(|m| m.to_vec()).collect();
+            let mut sorted: Vec<Vec<u8>> = members.clone();
             sorted.sort();
             let mut h: u64 = 0xC6A4A7935BD1E995;
             for m in &sorted {
@@ -240,12 +246,10 @@ impl Domain {
             Some(s) => s.clone(),
             None => return,
         };
-        let Some((conv_id, text)) = protocol::split_send(body) else {
+        let Some(SendReq { conv: conv_id, text: msg_body }) = SendReq::decode(body) else {
             self.enqueue(id, MsgType::Error, b"bad_send_format");
             return;
         };
-        let conv_id = conv_id.to_vec();
-        let msg_body = text.to_vec();
         if msg_body.is_empty() {
             self.enqueue(id, MsgType::Error, b"empty_message");
             return;
@@ -299,22 +303,28 @@ impl Domain {
         members.iter().any(|m| m.as_slice() == user)
     }
 
-    fn handle_list_convs(&mut self, id: ConnectionId) {
+    fn handle_list_convs(&mut self, id: ConnectionId, _body: &[u8]) {
         let session = match self.authenticated(id) {
             Some(s) => s.clone(),
             None => return,
         };
         let conv_ids = self.user_conversations.get(&session.user_id).cloned().unwrap_or_default();
-        let mut body = Vec::new();
-        for conv_id in &conv_ids {
-            body.extend_from_slice(conv_id);
-        }
+        let body = ConvsRespBody { ids: conv_ids.into_iter().collect() }.encode();
         self.enqueue(id, MsgType::ConvsResp, &body);
     }
 
-    fn handle_goodbye(&mut self, id: ConnectionId) {
+    fn handle_goodbye(&mut self, id: ConnectionId, _body: &[u8]) {
         self.remove_session(id);
         self.teardowns.push((id, TeardownReason::ClientGoodbye));
+    }
+
+    fn on_ping(&mut self, id: ConnectionId, _body: &[u8]) {
+        self.enqueue(id, MsgType::Pong, &[]);
+    }
+
+    fn on_presence(&mut self, id: ConnectionId, body: &[u8]) {
+        // pass-through echo, reserved for future online/offline notification
+        self.enqueue(id, MsgType::Presence, body);
     }
 
     /// drop the session for `id` and unregister it from the user's connection set
@@ -371,7 +381,7 @@ impl Domain {
             // hello flow: existing account — verify the user-chosen password
             (PendingKind::HelloLookup { user_id, password }, StoreResult::Account(Ok(Some(stored)))) => {
                 if Self::verify_password(&stored, &password) {
-                    self.enqueue(conn_id, MsgType::AuthOk, &[0u8]);
+                    self.enqueue(conn_id, MsgType::AuthOk, &AuthOkBody { created: false }.encode());
                     self.establish_session(conn_id, user_id);
                 } else {
                     self.enqueue(conn_id, MsgType::AuthFail, b"invalid_password");
@@ -399,7 +409,7 @@ impl Domain {
 
             // account create (after hello for new user)
             (PendingKind::AccountCreate { user_id }, StoreResult::Stored(Ok(()))) => {
-                self.enqueue(conn_id, MsgType::AuthOk, &[1u8]);
+                self.enqueue(conn_id, MsgType::AuthOk, &AuthOkBody { created: true }.encode());
                 self.establish_session(conn_id, user_id);
             }
             (PendingKind::AccountCreate { .. }, StoreResult::Stored(Err(e))) => {
@@ -435,7 +445,12 @@ impl Domain {
 
             // send: sequence obtained → deliver + ack
             (PendingKind::SendSeqNext { session, conv_id, msg_body, members }, StoreResult::Sequence(Ok(seq))) => {
-                let delivery = protocol::delivery_body(&conv_id, seq, &session.user_id, &msg_body);
+                let delivery = Delivery {
+                    conv: conv_id.clone(),
+                    seq,
+                    sender: session.user_id.clone(),
+                    text: msg_body,
+                }.encode();
                 for member in &members {
                     if member != &session.user_id
                         && let Some(conns) = self.user_connections.get(member)
@@ -453,11 +468,11 @@ impl Domain {
                         inbox_key.push(b'/');
                         inbox_key.extend_from_slice(&conv_id);
                         inbox_key.push(b'/');
-                        inbox_key.extend_from_slice(&protocol::write_u64_le(seq));
+                        inbox_key.extend_from_slice(&seq.to_le_bytes());
                         let _ = self.store.put_inbox_async(&inbox_key, &delivery);
                     }
                 }
-                self.enqueue(conn_id, MsgType::Delivered, &protocol::write_u64_le(seq));
+                self.enqueue(conn_id, MsgType::Delivered, &DeliveredBody { seq }.encode());
             }
             (PendingKind::SendSeqNext { .. }, StoreResult::Sequence(Err(e))) => {
                 self.enqueue(conn_id, MsgType::Error, format!("seq: {e}").as_bytes());
@@ -495,22 +510,34 @@ impl Domain {
 
 // EventHandler implementation
 
+/// generate the `on_frame` dispatcher from a single `MsgType => handler` list;
+/// invoke it directly in the `EventHandler` impl. The handler methods live in
+/// the [`Domain`] impl. Adding an inbound message type = add one handler method
+/// + one row here.
+macro_rules! server_msgs {
+    ($( $ty:ident => $handler:ident ),+ $(,)?) => {
+        fn on_frame(&mut self, id: ConnectionId, frame: OwnedFrame) {
+            match frame.msg_type {
+                $( MsgType::$ty => self.$handler(id, &frame.body), )*
+                _ => {}
+            }
+        }
+    };
+}
+
 impl EventHandler for Domain {
     fn on_accept(&mut self, id: ConnectionId, _peer: SocketAddrV4) {
         self.sessions.insert(id, Session { user_id: Vec::new(), authenticated: false });
     }
 
-    fn on_frame(&mut self, id: ConnectionId, frame: OwnedFrame) {
-        match frame.msg_type {
-            MsgType::Hello => self.handle_hello(id, &frame.body),
-            MsgType::Goodbye => self.handle_goodbye(id),
-            MsgType::CreateConv => self.handle_create_conv(id, &frame.body),
-            MsgType::Send => self.handle_send(id, &frame.body),
-            MsgType::ListConvs => self.handle_list_convs(id),
-            MsgType::Ping => self.enqueue(id, MsgType::Pong, &[]),
-            MsgType::Presence => self.enqueue(id, MsgType::Presence, &frame.body),
-            _ => {}
-        }
+    server_msgs! {
+        Hello => handle_hello,
+        Goodbye => handle_goodbye,
+        CreateConv => handle_create_conv,
+        Send => handle_send,
+        ListConvs => handle_list_convs,
+        Ping => on_ping,
+        Presence => on_presence,
     }
 
     fn on_teardown(&mut self, id: ConnectionId, _reason: TeardownReason) {

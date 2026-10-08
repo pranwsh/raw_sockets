@@ -172,3 +172,69 @@ fn crc_is_castagnoli() {
     // known-vector sanity check for crc32c against RFC 4960 / widely cited reference: crc32c of "123456789" = 0xE3069283
     assert_eq!(crc32c(b"123456789"), 0xE3069283);
 }
+
+// message registry
+
+#[test]
+fn registry_round_trips_ids() {
+    for &t in MsgType::ALL {
+        assert_eq!(MsgType::from_u16(t.as_u16()), Some(t));
+    }
+    assert_eq!(MsgType::from_u16(0x1FFF), None);
+}
+
+#[test]
+fn registry_has_no_duplicate_ids() {
+    let mut ids = std::collections::HashSet::new();
+    for t in MsgType::ALL {
+        assert!(ids.insert(t.as_u16()), "duplicate wire id {}", t.as_u16());
+    }
+}
+
+// body codecs
+
+#[test]
+fn payload_round_trips() {
+    let hello = HelloReq { user: b"alice".to_vec(), password: b"hunter2".to_vec() };
+    assert_eq!(HelloReq::decode(&hello.encode()).unwrap(), hello);
+
+    let create = CreateConvReq { members: vec![b"alice".to_vec(), b"bob".to_vec()] };
+    assert_eq!(CreateConvReq::decode(&create.encode()).unwrap(), create);
+
+    let send = SendReq { conv: vec![0xAA; 8], text: b"hi".to_vec() };
+    assert_eq!(SendReq::decode(&send.encode()).unwrap(), send);
+
+    let delivery = Delivery {
+        conv: vec![0xBB; 8],
+        seq: 42,
+        sender: b"alice".to_vec(),
+        text: b"ello".to_vec(),
+    };
+    assert_eq!(Delivery::decode(&delivery.encode()).unwrap(), delivery);
+
+    let convs = ConvsRespBody { ids: vec![vec![1u8; 8], vec![2u8; 8]] };
+    assert_eq!(ConvsRespBody::decode(&convs.encode()).unwrap(), convs);
+
+    let aok = AuthOkBody { created: true };
+    assert_eq!(AuthOkBody::decode(&aok.encode()).unwrap(), aok);
+
+    let d: DeliveredBody = DeliveredBody { seq: 7 };
+    assert_eq!(DeliveredBody::decode(&d.encode()).unwrap(), d);
+
+    assert_eq!(Empty::decode(&Empty.encode()), Some(Empty));
+
+    let op = Opaque(vec![1, 2, 3]);
+    assert_eq!(Opaque::decode(&op.encode()).unwrap(), op);
+}
+
+#[test]
+fn payload_rejects_malformed_bodies() {
+    assert_eq!(HelloReq::decode(b"no-newline"), None);
+    assert_eq!(SendReq::decode(b"just-one-field"), None);
+    // <conv>\n + fewer than 8 seq bytes
+    assert_eq!(Delivery::decode(b"conv\n\x00\x00"), None);
+    assert_eq!(AuthOkBody::decode(&[2]), None);
+    assert_eq!(AuthOkBody::decode(b""), None);
+    assert_eq!(DeliveredBody::decode(&[0u8; 4]), None);
+    assert_eq!(Empty::decode(b"x"), None);
+}

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 // reuse the workspace's protocol crate for frame encoding/decoding
 // this is the actual protocol logic — the test verifies that the server speaks it correctly
-use protocol::{self, MsgType, OwnedFrame, Decode};
+use protocol::{self, HelloReq, MsgType, OwnedFrame, Payload, SendReq, Decode};
 
 // helpers
 
@@ -97,7 +97,7 @@ impl TestClient {
 
     /// send a Hello(user_id \n password) frame
     fn hello(&mut self, user_id: &[u8], password: &[u8]) {
-        let body = protocol::hello_body(user_id, password);
+        let body = HelloReq { user: user_id.to_vec(), password: password.to_vec() }.encode();
         self.send_frame(MsgType::Hello, 0, &body);
     }
 
@@ -217,7 +217,7 @@ fn test_create_conv_and_send() {
     let conv_id = created.body.to_vec();
 
     // send a message to the conversation
-    let msg = protocol::send_body(&conv_id, b"Hello, Bob!");
+    let msg = SendReq { conv: conv_id.clone(), text: b"Hello, Bob!".to_vec() }.encode();
     alice.send_frame(MsgType::Send, 0, &msg);
 
     // alice should get a Delivered ack for her send (other members are the

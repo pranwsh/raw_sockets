@@ -12,7 +12,12 @@
 
 pub use chat_model::{Action, Event};
 
-use protocol::{self, Decode, MsgType, OwnedFrame};
+// per-message wire↔model bridge modules; the generated `encode_action` and
+// `decode_event` live in `msgs`
+mod msgs;
+use msgs::{decode_event, encode_action};
+
+use protocol::{self, Decode, OwnedFrame};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::mpsc;
@@ -81,7 +86,7 @@ fn run_loop(
         // drain any queued actions first
         let mut write_failed = false;
         for action in action_rx.try_iter() {
-            if let Some((msg_type, body)) = encode_action(action, &mut authenticated) {
+            if let Some((msg_type, body)) = encode_action(&action, &mut authenticated) {
                 let frame = protocol::encode(msg_type, 0, &body);
                 if stream.write_all(&frame).is_err() {
                     write_failed = true;
@@ -131,88 +136,17 @@ fn run_loop(
     let _ = event_tx.send(Event::Disconnected { reason: "connection closed".into() });
 }
 
-// Action → wire frame
-
-fn encode_action(action: Action, authenticated: &mut Option<Vec<u8>>) -> Option<(MsgType, Box<[u8]>)> {
-    match action {
-        Action::Hello { user, password } => {
-            *authenticated = Some(user.clone().into_bytes());
-            let body = protocol::hello_body(user.as_bytes(), password.as_bytes());
-            Some((MsgType::Hello, body.into_boxed_slice()))
-        }
-        Action::CreateConv { mut members } => {
-            if let Some(me) = authenticated.as_ref() {
-                let me = String::from_utf8_lossy(me);
-                if !members.iter().any(|m| *m == me) {
-                    members.insert(0, me.into_owned());
-                }
-            }
-            let body = members.join(",").into_bytes();
-            Some((MsgType::CreateConv, body.into_boxed_slice()))
-        }
-        Action::ListConvs => Some((MsgType::ListConvs, Vec::new().into_boxed_slice())),
-        Action::Send { conv, text } => {
-            let body = protocol::send_body(&conv, text.as_bytes());
-            Some((MsgType::Send, body.into_boxed_slice()))
-        }
-        Action::Ping => Some((MsgType::Ping, Vec::new().into_boxed_slice())),
-        Action::Goodbye => Some((MsgType::Goodbye, Vec::new().into_boxed_slice())),
-    }
-}
-
-// wire frame → Event
-
-fn decode_event(f: OwnedFrame) -> Event {
-    match f.msg_type {
-        MsgType::AuthOk => {
-            let created = f.body.first() == Some(&1);
-            Event::AuthOk { created }
-        }
-        MsgType::AuthFail => {
-            Event::AuthFail { reason: String::from_utf8_lossy(&f.body).into_owned() }
-        }
-        MsgType::ConvCreated => Event::ConvCreated { id: f.body.to_vec() },
-        MsgType::ConvsResp => {
-            let mut ids = Vec::new();
-            for chunk in f.body.chunks_exact(8) {
-                ids.push(chunk.to_vec());
-            }
-            Event::Convs { ids }
-        }
-        MsgType::Send => {
-            // body: conv_id "\n" seq(8 LE) sender "\n" text
-            match protocol::split_delivery(&f.body) {
-                Some((conv, seq, from, text)) => Event::Message {
-                    conv: conv.to_vec(),
-                    from: String::from_utf8_lossy(from).into_owned(),
-                    seq,
-                    text: String::from_utf8_lossy(text).into_owned(),
-                },
-                None => Event::Error { msg: "malformed inbound Send frame".into() },
-            }
-        }
-        MsgType::Delivered => {
-            match protocol::read_u64_le(&f.body) {
-                Some(seq) => Event::Delivered { seq },
-                None => Event::Error { msg: "malformed Delivered frame".into() },
-            }
-        }
-        MsgType::Pong => Event::Pong,
-        MsgType::Error => {
-            Event::Error { msg: String::from_utf8_lossy(&f.body).into_owned() }
-        }
-        MsgType::Goodbye => Event::Disconnected { reason: "goodbye".into() },
-        other => Event::Error { msg: format!("unhandled message type: {other:?}") },
-    }
-}
+// Action → wire frame conversions and wire frame → Event conversions are
+// generated from the per-message bridge modules in `msgs` (see `msgs/mod.rs`).
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::MsgType;
 
     fn roundtrip(action: Action) -> OwnedFrame {
         let mut auth = None;
-        let (ty, body) = encode_action(action, &mut auth).expect("encodes");
+        let (ty, body) = encode_action(&action, &mut auth).expect("encodes");
         let bytes = protocol::encode(ty, 0, &body);
         match protocol::decode(&bytes) {
             Decode::Complete { frame, .. } => OwnedFrame::from_borrowed(&frame),
@@ -234,14 +168,14 @@ mod tests {
     fn create_conv_prepends_user() {
         let mut auth = None;
         let (ty, _) = encode_action(
-            Action::Hello { user: "alice".into(), password: "x".into() },
+            &Action::Hello { user: "alice".into(), password: "x".into() },
             &mut auth,
         )
         .expect("hello encodes");
         assert_eq!(ty, MsgType::Hello);
 
         let (ty, body) = encode_action(
-            Action::CreateConv { members: vec!["bob".into()] },
+            &Action::CreateConv { members: vec!["bob".into()] },
             &mut auth,
         )
         .expect("create encodes");
