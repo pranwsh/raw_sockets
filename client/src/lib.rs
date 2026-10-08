@@ -19,22 +19,27 @@ use msgs::{decode_event, encode_action};
 
 use protocol::{self, Decode, OwnedFrame};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 /// a connected client: send [`Action`]s in, receive [`Event`]s out
+///
+/// The socket is shared by two threads. A blocking reader thread owns the read
+/// half and parks in the kernel until data arrives, so an idle client costs no
+/// CPU. A second thread drains [`Action`]s and writes them as soon as they are
+/// queued, so outbound latency does not depend on inbound traffic.
 #[derive(Debug)]
 pub struct Client {
     action_tx: mpsc::Sender<Action>,
     event_rx: mpsc::Receiver<Event>,
-    _join: thread::JoinHandle<()>,
+    /// a clone kept only so `Drop` can unblock the parked reader
+    closer: Option<TcpStream>,
 }
 
 impl Client {
     /// open a connection to the messaging server at `host:port` and spawn the
-    /// background thread that owns the socket. Returns once the TCP connection
+    /// background threads that own the socket. Returns once the TCP connection
     /// is established.
     pub fn connect(host: &str, port: u16) -> io::Result<Client> {
         let addr = format!("{}:{}", host, port);
@@ -43,21 +48,28 @@ impl Client {
         // an unacknowledged in-flight write would otherwise hold up the next
         // frame for up to ~40ms (delayed-ACK).
         stream.set_nodelay(true)?;
-        // The background loop does a blocking read and can only drain the
-        // action channel (and notice disconnects) when that read returns. A
-        // short timeout keeps actions flowing promptly: with 100ms, a queued
-        // Send could sit in the channel for ~100ms before being written to the
-        // socket, adding noticeable end-to-end latency. 1ms keeps pickup
-        // bounded to ~1ms at negligible CPU cost.
-        stream.set_read_timeout(Some(Duration::from_millis(1)))?;
+
+        // `try_clone` dups the fd, so both halves refer to the same connection.
+        // Only the reader sets a read timeout: it stays a *blocking* read with a
+        // generous ceiling, so a quiet connection never turns into a busy loop
+        // while a silent peer is still eventually noticed.
+        let reader_stream = stream.try_clone()?;
+        reader_stream.set_read_timeout(Some(READ_PARK_TIMEOUT))?;
 
         let (action_tx, action_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let _ = event_tx.send(Event::Connected);
 
-        let _join = thread::spawn(move || run_loop(stream, action_rx, event_tx));
+        let closer = stream.try_clone()?;
+        let writer_stream = stream;
+        thread::spawn(move || read_loop(reader_stream, event_tx));
+        thread::spawn(move || write_loop(writer_stream, action_rx));
 
-        Ok(Client { action_tx, event_rx, _join })
+        Ok(Client {
+            action_tx,
+            event_rx,
+            closer: Some(closer),
+        })
     }
 
     /// queue an action to be sent; returns false if the connection is gone
@@ -69,71 +81,133 @@ impl Client {
     pub fn events(&self) -> &mpsc::Receiver<Event> {
         &self.event_rx
     }
+
+    /// drain every pending [`Event`] into `out`, reusing its allocation.
+    ///
+    /// The frontend calls this once per drawn frame, so letting the caller own
+    /// the buffer avoids a fresh `Vec` allocation on every frame. Returns the
+    /// number of events drained.
+    pub fn drain_events(&self, out: &mut Vec<Event>) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = self.event_rx.try_recv() {
+            out.push(ev);
+            n += 1;
+        }
+        n
+    }
 }
 
-// background loop — the only place that touches the socket
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Shutting down both halves makes the reader's parked `read` return
+        // immediately instead of holding the thread until the peer disconnects.
+        if let Some(s) = self.closer.take() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    }
+}
 
-fn run_loop(
-    mut stream: TcpStream,
-    action_rx: mpsc::Receiver<Action>,
-    event_tx: mpsc::Sender<Event>,
-) {
-    let mut authenticated: Option<Vec<u8>> = None;
-    let mut buf = Vec::with_capacity(65536);
+// how long the reader may park in the kernel before re-checking liveness. This
+// bounds how long a silent server takes to be noticed; it is not a latency
+// path — a healthy connection is woken by the kernel the moment bytes arrive.
+const READ_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+// reader thread — the only place that decodes inbound frames
+
+fn read_loop(mut stream: TcpStream, event_tx: mpsc::Sender<Event>) {
+    // amortised: the buffer grows to the largest frame seen and is then reused
+    let mut buf = Vec::with_capacity(READ_BUF_INIT);
+    let mut scratch = vec![0u8; READ_CHUNK];
     let mut offset = 0usize;
 
     loop {
-        // drain any queued actions first
-        let mut write_failed = false;
-        for action in action_rx.try_iter() {
-            if let Some((msg_type, body)) = encode_action(&action, &mut authenticated) {
-                let frame = protocol::encode(msg_type, 0, &body);
-                if stream.write_all(&frame).is_err() {
-                    write_failed = true;
-                    break;
-                }
-            }
-        }
-        if write_failed {
-            break;
+        // compact first so `buf[offset..]` is the unconsumed tail; `buf` grows
+        // monotonically to the largest frame instead of being drained each round
+        if offset > 0 {
+            buf.copy_within(offset.., 0);
+            buf.truncate(buf.len() - offset);
+            offset = 0;
         }
 
-        // read a chunk (blocks up to the read timeout)
-        let mut tmp = [0u8; 8192];
-        match stream.read(&mut tmp) {
+        match stream.read(&mut scratch) {
             Ok(0) => break, // clean EOF — server closed
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                loop {
-                    let slice = &buf[offset..];
-                    match protocol::decode(slice) {
-                        Decode::Complete { frame, consumed } => {
-                            offset += consumed;
-                            let owned = OwnedFrame::from_borrowed(&frame);
-                            if event_tx.send(decode_event(owned)).is_err() {
-                                return; // receiver dropped; nothing left to do
-                            }
-                        }
-                        Decode::Need => break,
-                        // misaligned garbage: skip one byte and resync
-                        Decode::Err(_) => {
-                            offset += 1;
-                        }
-                    }
-                }
-                if offset > 4096 {
-                    buf.drain(..offset);
-                    offset = 0;
-                }
-            }
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                // nothing pending on the wire; loop to check for new actions
+            Ok(n) => buf.extend_from_slice(&scratch[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if is_park_timeout(&e) => {
+                // liveness poll; nothing pending on the wire
+                continue;
             }
             Err(_) => break,
         }
+
+        loop {
+            match protocol::decode(&buf[offset..]) {
+                Decode::Complete { frame, consumed } => {
+                    offset += consumed;
+                    let owned = OwnedFrame::from_borrowed(&frame);
+                    if event_tx.send(decode_event(owned)).is_err() {
+                        return; // receiver dropped; nothing left to do
+                    }
+                }
+                Decode::Need => break,
+                // misaligned garbage: skip one byte and resync
+                Decode::Err(_) => offset += 1,
+            }
+        }
+
+        if offset == buf.len() {
+            // everything consumed; reset to the empty tail
+            offset = 0;
+            buf.clear();
+        }
     }
 
-    let _ = event_tx.send(Event::Disconnected { reason: "connection closed".into() });
+    let _ = event_tx.send(Event::Disconnected {
+        reason: "connection closed".into(),
+    });
+}
+
+// writer thread — parks on the action channel, writes frames as they arrive
+
+fn write_loop(mut stream: TcpStream, action_rx: mpsc::Receiver<Action>) {
+    let mut authenticated: Option<Vec<u8>> = None;
+    // reused across writes so a steady send loop allocates no frame buffers
+    let mut frame: Vec<u8> = Vec::with_capacity(1024);
+
+    // `recv` blocks until an action is queued: no polling, no wakeups while idle
+    while let Ok(action) = action_rx.recv() {
+        let Some((msg_type, body)) = encode_action(&action, &mut authenticated) else {
+            continue;
+        };
+        let total = protocol::frame_len(body.len());
+        frame.clear();
+        frame.resize(total, 0);
+        // `seal` writes header+CRC in place, so the body is copied in exactly once
+        frame[protocol::HEADER_LEN..protocol::HEADER_LEN + body.len()].copy_from_slice(&body);
+        protocol::seal(&mut frame, msg_type, 0, body.len());
+        if stream.write_all(&frame).is_err() {
+            break;
+        }
+    }
+    // signal a clean end-of-stream so the server sees a prompt close rather
+    // than waiting out its own keepalive
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
+// buffer sizing
+
+/// initial read-buffer size; grows to fit the largest frame seen
+const READ_BUF_INIT: usize = 64 * 1024;
+/// kernel read granularity
+const READ_CHUNK: usize = 16 * 1024;
+
+#[inline]
+fn is_park_timeout(e: &io::Error) -> bool {
+    // a blocking socket with SO_RCVTIMEO surfaces both, depending on platform
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 // Action → wire frame conversions and wire frame → Event conversions are
@@ -168,14 +242,19 @@ mod tests {
     fn create_conv_prepends_user() {
         let mut auth = None;
         let (ty, _) = encode_action(
-            &Action::Hello { user: "alice".into(), password: "x".into() },
+            &Action::Hello {
+                user: "alice".into(),
+                password: "x".into(),
+            },
             &mut auth,
         )
         .expect("hello encodes");
         assert_eq!(ty, MsgType::Hello);
 
         let (ty, body) = encode_action(
-            &Action::CreateConv { members: vec!["bob".into()] },
+            &Action::CreateConv {
+                members: vec!["bob".into()],
+            },
             &mut auth,
         )
         .expect("create encodes");
@@ -208,11 +287,19 @@ mod tests {
 
     #[test]
     fn auth_events() {
-        assert_eq!(event_from(MsgType::AuthOk, &[0]), Event::AuthOk { created: false });
-        assert_eq!(event_from(MsgType::AuthOk, &[1]), Event::AuthOk { created: true });
+        assert_eq!(
+            event_from(MsgType::AuthOk, &[0]),
+            Event::AuthOk { created: false }
+        );
+        assert_eq!(
+            event_from(MsgType::AuthOk, &[1]),
+            Event::AuthOk { created: true }
+        );
         assert_eq!(
             event_from(MsgType::AuthFail, b"invalid_password"),
-            Event::AuthFail { reason: "invalid_password".into() }
+            Event::AuthFail {
+                reason: "invalid_password".into()
+            }
         );
     }
 
@@ -242,7 +329,9 @@ mod tests {
         body[8..].copy_from_slice(&[2u8; 8]);
         assert_eq!(
             event_from(MsgType::ConvsResp, &body),
-            Event::Convs { ids: vec![vec![1u8; 8], vec![2u8; 8]] }
+            Event::Convs {
+                ids: vec![vec![1u8; 8], vec![2u8; 8]]
+            }
         );
         assert_eq!(
             event_from(MsgType::Delivered, &7u64.to_le_bytes()),

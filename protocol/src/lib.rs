@@ -14,6 +14,9 @@ pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 8;
 pub const TRAILER_LEN: usize = 4; // crc32c
 pub const FRAME_OVERHEAD: usize = HEADER_LEN + TRAILER_LEN;
+
+/// total wire size of a frame whose body is `body_len` bytes
+pub const fn frame_len(body_len: usize) -> usize { HEADER_LEN + body_len + TRAILER_LEN }
 pub const MAX_BODY_LEN: usize = 16 * 1024 * 1024;
 
 pub const FLAG_COMPRESSED: u16 = 1 << 15;
