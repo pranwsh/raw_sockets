@@ -162,11 +162,21 @@ single `ConvsResp` frame.
 
 ### `ConvsResp` (38) — Server → Client
 
-**Body**: concatenated 8-byte conversation IDs (little-endian u64), one per
-conversation.
+**Body**: one record per conversation, concatenated:
+
+```
+<8-byte conv id><comma-separated member ids>\n
+```
+
+The id is a fixed 8 bytes, so each record is self-delimiting: the trailing
+newline terminates the member list. Members are sorted by the server, so the
+label a frontend renders (`alice, bob`) is stable across reconnects.
 
 Sent in response to `ListConvs`. An empty body means the user has no
 conversations.
+
+Member names travel with the ids so a client can label a conversation with
+who is in it instead of showing an opaque hex id.
 
 ### `Ping` (90) — Bidirectional
 

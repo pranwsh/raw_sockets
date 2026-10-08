@@ -6,7 +6,7 @@ mod sha256;
 
 use protocol::{
     self, AuthOkBody, ConvsRespBody, CreateConvReq, DeliveredBody, Delivery, HelloReq, MsgType,
-    OwnedFrame, Payload, SendReq,
+    ConvEntry, OwnedFrame, Payload, SendReq,
 };
 use storage::{Store, StoreResult};
 use transport::{ConnectionId, EventHandler, TeardownReason};
@@ -309,7 +309,16 @@ impl Domain {
             None => return,
         };
         let conv_ids = self.user_conversations.get(&session.user_id).cloned().unwrap_or_default();
-        let body = ConvsRespBody { ids: conv_ids.into_iter().collect() }.encode();
+        // Carry member names alongside each id so a frontend can render a
+        // readable label ("alice, bob") instead of an opaque hex id. Members
+        // are sorted here so the label is stable across reconnects.
+        let mut convs = Vec::with_capacity(conv_ids.len());
+        for conv_id in conv_ids {
+            let mut members = self.conversations.get(&conv_id).cloned().unwrap_or_default();
+            members.sort();
+            convs.push(ConvEntry { id: conv_id, members });
+        }
+        let body = ConvsRespBody { convs }.encode();
         self.enqueue(id, MsgType::ConvsResp, &body);
     }
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 // reuse the workspace's protocol crate for frame encoding/decoding
 // this is the actual protocol logic — the test verifies that the server speaks it correctly
-use protocol::{self, HelloReq, MsgType, OwnedFrame, Payload, SendReq, Decode};
+use protocol::{self, ConvsRespBody, HelloReq, MsgType, OwnedFrame, Payload, SendReq, Decode};
 
 // helpers
 
@@ -228,6 +228,37 @@ fn test_create_conv_and_send() {
             break;
         }
     }
+}
+
+#[test]
+fn test_list_convs_returns_member_names() {
+    let (_server, addr) = spawn_server();
+    let mut alice = TestClient::connect(addr).unwrap();
+
+    alice.hello(b"alice", b"hunter2");
+    assert_eq!(alice.recv_frame().msg_type, MsgType::AuthOk);
+
+    alice.send_frame(MsgType::CreateConv, 0, b"alice,bob");
+    let created = alice.recv_frame();
+    assert_eq!(created.msg_type, MsgType::ConvCreated);
+    let conv_id = created.body.to_vec();
+
+    alice.send_frame(MsgType::ListConvs, 0, b"");
+    let resp = alice.recv_frame();
+    assert_eq!(resp.msg_type, MsgType::ConvsResp);
+
+    // the listing must carry the member names, not just the opaque id, so a
+    // frontend can render a readable label
+    let listing = ConvsRespBody::decode(&resp.body).expect("decodes");
+    assert_eq!(listing.convs.len(), 1, "expected exactly one conversation");
+    assert_eq!(listing.convs[0].id, conv_id, "listing id must match the created id");
+    let mut members: Vec<String> = listing.convs[0]
+        .members
+        .iter()
+        .map(|m| String::from_utf8_lossy(m).into_owned())
+        .collect();
+    members.sort();
+    assert_eq!(members, vec!["alice".to_string(), "bob".to_string()]);
 }
 
 #[test]

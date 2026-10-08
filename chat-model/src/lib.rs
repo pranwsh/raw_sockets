@@ -8,6 +8,16 @@
 
 #![forbid(unsafe_code)]
 
+/// a conversation as the server describes it: an opaque id plus the members
+/// that can label it for a human
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvInfo {
+    /// the conversation id (8 bytes on the wire)
+    pub id: Vec<u8>,
+    /// member user ids, sorted by the server so labels are stable
+    pub members: Vec<String>,
+}
+
 /// a high-level operation the caller wants the connected server to perform
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -35,9 +45,9 @@ pub enum Event {
     /// authentication was rejected
     AuthFail { reason: String },
     /// the server created a conversation and returned its id
-    ConvCreated { id: Vec<u8> },
+    ConvCreated(ConvInfo),
     /// the server's response to [`Action::ListConvs`]
-    Convs { ids: Vec<Vec<u8>> },
+    Convs { convs: Vec<ConvInfo> },
     /// an inbound message (delivered to this connection)
     Message { conv: Vec<u8>, from: String, seq: u64, text: String },
     /// our [`Action::Send`] was accepted with a sequence number

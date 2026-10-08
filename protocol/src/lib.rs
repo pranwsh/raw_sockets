@@ -326,23 +326,56 @@ impl Payload for AuthOkBody {
     }
 }
 
-/// `ConvsResp` body: concatenated 8-byte (LE) conversation ids
+/// `ConvsResp` body: per conversation, its 8-byte id followed by a newline
+/// separated member list
+///
+/// Members are carried so a frontend can label a conversation `alice, bob`
+/// instead of an opaque id. The list is sorted by the server, so the label is
+/// stable across reconnects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvsRespBody {
-    pub ids: Vec<Vec<u8>>,
+    pub convs: Vec<ConvEntry>,
+}
+
+/// one conversation in a [`ConvsRespBody`] listing
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvEntry {
+    pub id: Vec<u8>,
+    pub members: Vec<Vec<u8>>,
 }
 
 impl Payload for ConvsRespBody {
     fn encode(&self) -> Vec<u8> {
-        let mut body = Vec::with_capacity(self.ids.len() * 8);
-        for id in &self.ids {
-            body.extend_from_slice(id);
+        let mut body = Vec::with_capacity(self.convs.len() * 32);
+        for c in &self.convs {
+            body.extend_from_slice(&c.id);
+            body.extend_from_slice(&CreateConvReq { members: c.members.clone() }.encode());
+            // terminate each entry: the id is fixed width, so a trailing
+            // separator makes the record self-delimiting without a length
+            body.push(b'\n');
         }
         body
     }
     fn decode(body: &[u8]) -> Option<Self> {
-        let ids: Vec<Vec<u8>> = body.chunks_exact(8).map(|c| c.to_vec()).collect();
-        Some(ConvsRespBody { ids })
+        let mut convs = Vec::new();
+        for entry in body.split(|&b| b == b'\n') {
+            // the trailing separator yields one empty final chunk; skip it
+            if entry.is_empty() {
+                continue;
+            }
+            if entry.len() < 8 {
+                return None;
+            }
+            // the id is a fixed 8 bytes, so the rest of the record is members
+            let (id, members_raw) = entry.split_at(8);
+            let members: Vec<Vec<u8>> = members_raw
+                .split(|&b| b == b',')
+                .filter(|m| !m.is_empty())
+                .map(|m| m.to_vec())
+                .collect();
+            convs.push(ConvEntry { id: id.to_vec(), members });
+        }
+        Some(ConvsRespBody { convs })
     }
 }
 

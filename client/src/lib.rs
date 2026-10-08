@@ -217,6 +217,7 @@ fn is_park_timeout(e: &io::Error) -> bool {
 mod tests {
     use super::*;
     use protocol::MsgType;
+    use chat_model::ConvInfo;
 
     fn roundtrip(action: Action) -> OwnedFrame {
         let mut auth = None;
@@ -323,16 +324,34 @@ mod tests {
     }
 
     #[test]
-    fn convs_and_delivered() {
-        let mut body = vec![0u8; 16];
-        body[..8].copy_from_slice(&[1u8; 8]);
-        body[8..].copy_from_slice(&[2u8; 8]);
+    fn convs_carry_member_names() {
+        // each record is `<8-byte id><comma-separated members>\n`
+        let mut body = Vec::new();
+        body.extend_from_slice(&[1u8; 8]);
+        body.extend_from_slice(b"alice,bob\n");
+        body.extend_from_slice(&[2u8; 8]);
+        body.extend_from_slice(b"carol,dave,erin\n");
         assert_eq!(
             event_from(MsgType::ConvsResp, &body),
             Event::Convs {
-                ids: vec![vec![1u8; 8], vec![2u8; 8]]
+                convs: vec![
+                    ConvInfo { id: vec![1u8; 8], members: vec!["alice".into(), "bob".into()] },
+                    ConvInfo {
+                        id: vec![2u8; 8],
+                        members: vec!["carol".into(), "dave".into(), "erin".into()],
+                    },
+                ],
             }
         );
+    }
+
+    #[test]
+    fn empty_convs_body_is_empty_listing() {
+        assert_eq!(event_from(MsgType::ConvsResp, b""), Event::Convs { convs: vec![] });
+    }
+
+    #[test]
+    fn delivered_seq() {
         assert_eq!(
             event_from(MsgType::Delivered, &7u64.to_le_bytes()),
             Event::Delivered { seq: 7 }
