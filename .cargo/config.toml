@@ -1,0 +1,21 @@
+# NixOS / nix-shell toolchain discovery.
+#
+# The C toolchain is provided by a Nix gcc wrapper that lives in the store and
+# is only on PATH inside an interactive shell. Anything that builds without
+# sourcing that shell — an IDE task runner, a GUI-launched terminal, a container,
+# CI — reaches rustc with no `cc` on PATH and fails with
+#
+#     error: linker `cc` not found
+#
+# which surfaces as a pile of confusing "could not compile X (build script)"
+# errors for proc-macro and dependency crates.
+#
+# Point the linker at the store path directly so those builds work regardless
+# of the invoking shell. Keep the wrapper (not a bare gcc): it sets up the
+# dynamic linker and library search paths that Nix needs.
+#
+# If your Nix hash differs, regenerate the path above with:
+#   nix eval --raw --impure --expr \
+#     '(builtins.getFlake "github:NixOS/nixpkgs/nixos-unstable").legacyPackages.x86_64-linux.stdenv.cc.outPath'
+[target.x86_64-unknown-linux-gnu]
+linker = "/nix/store/w88q44gqd1qg5wmkk7v0h97rpiqvam0l-gcc-wrapper-15.3.0/bin/gcc"
