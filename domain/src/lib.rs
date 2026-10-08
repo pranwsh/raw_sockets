@@ -498,9 +498,13 @@ impl Domain {
 
             // CreateConv store complete
             (PendingKind::CreateConvStore { conv_id, members_raw }, StoreResult::Stored(Ok(()))) => {
-                self.enqueue(conn_id, MsgType::ConvCreated, &conv_id);
                 let members: Vec<Vec<u8>> =
                     members_raw.split(|&b| b == b',').filter(|m| !m.is_empty()).map(|m| m.to_vec()).collect();
+                // reply with the member list, not just the id, so the creating
+                // client can label the conversation straight away instead of
+                // waiting for a ListConvs round trip
+                let entry = ConvEntry { id: conv_id.clone(), members: members.clone() };
+                self.enqueue(conn_id, MsgType::ConvCreated, &entry.encode());
                 self.conversations.insert(conv_id.clone(), members.clone());
                 for member in members {
                     self.user_conversations.entry(member).or_default().insert(conv_id.clone());

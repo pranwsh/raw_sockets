@@ -331,6 +331,9 @@ mod tests {
         body.extend_from_slice(b"alice,bob\n");
         body.extend_from_slice(&[2u8; 8]);
         body.extend_from_slice(b"carol,dave,erin\n");
+        // a record without its terminator is malformed
+        assert!(event_from(MsgType::ConvsResp, b"\x01\x01\x01\x01\x01\x01\x01\x01alice")
+            != Event::Convs { convs: vec![] });
         assert_eq!(
             event_from(MsgType::ConvsResp, &body),
             Event::Convs {

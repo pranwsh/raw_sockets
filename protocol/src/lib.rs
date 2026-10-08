@@ -344,15 +344,49 @@ pub struct ConvEntry {
     pub members: Vec<Vec<u8>>,
 }
 
+impl ConvEntry {
+    /// append this entry's wire form to `out`
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.id);
+        out.extend_from_slice(&CreateConvReq { members: self.members.clone() }.encode());
+        // terminate each entry: the id is fixed width, so a trailing separator
+        // makes the record self-delimiting without a length prefix
+        out.push(b'\n');
+    }
+}
+
+impl Payload for ConvEntry {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.id.len() + 32);
+        self.encode_into(&mut out);
+        out
+    }
+    fn decode(body: &[u8]) -> Option<Self> {
+        // a standalone record (`ConvCreated`) carries its own terminator
+        let body = body.strip_suffix(b"\n")?;
+        ConvEntry::decode_record(body)
+    }
+}
+
+impl ConvEntry {
+    /// decode one record whose trailing separator has already been stripped
+    fn decode_record(record: &[u8]) -> Option<Self> {
+        // the id is fixed width, so the remainder of the record is the members
+        let (id, members_raw) = record.split_at(8);
+        let members: Vec<Vec<u8>> = members_raw
+            .split(|&b| b == b',')
+            .filter(|m| !m.is_empty())
+            .map(|m| m.to_vec())
+            .collect();
+        Some(ConvEntry { id: id.to_vec(), members })
+    }
+}
+
 impl Payload for ConvsRespBody {
     fn encode(&self) -> Vec<u8> {
         let mut body = Vec::with_capacity(self.convs.len() * 32);
         for c in &self.convs {
-            body.extend_from_slice(&c.id);
-            body.extend_from_slice(&CreateConvReq { members: c.members.clone() }.encode());
-            // terminate each entry: the id is fixed width, so a trailing
-            // separator makes the record self-delimiting without a length
-            body.push(b'\n');
+            c.encode_into(&mut body);
         }
         body
     }
@@ -366,14 +400,7 @@ impl Payload for ConvsRespBody {
             if entry.len() < 8 {
                 return None;
             }
-            // the id is a fixed 8 bytes, so the rest of the record is members
-            let (id, members_raw) = entry.split_at(8);
-            let members: Vec<Vec<u8>> = members_raw
-                .split(|&b| b == b',')
-                .filter(|m| !m.is_empty())
-                .map(|m| m.to_vec())
-                .collect();
-            convs.push(ConvEntry { id: id.to_vec(), members });
+            convs.push(ConvEntry::decode_record(entry)?);
         }
         Some(ConvsRespBody { convs })
     }

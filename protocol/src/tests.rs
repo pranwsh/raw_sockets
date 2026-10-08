@@ -223,6 +223,15 @@ fn payload_round_trips() {
     let none = ConvsRespBody { convs: vec![] };
     assert_eq!(ConvsRespBody::decode(&none.encode()).unwrap(), none);
 
+    // a single entry uses the same record format, so `ConvCreated` can carry
+    // the member list too
+    let one = ConvEntry { id: vec![9u8; 8], members: vec![b"alice".to_vec(), b"bob".to_vec()] };
+    assert_eq!(ConvEntry::decode(&one.encode()).unwrap(), one);
+    // an entry without its terminator is rejected
+    assert!(ConvEntry::decode(b"\x09\x09\x09\x09\x09\x09\x09\x09alice,bob").is_none());
+    // a record too short to hold an id is rejected outright
+    assert!(ConvsRespBody::decode(b"short").is_none());
+
     let aok = AuthOkBody { created: true };
     assert_eq!(AuthOkBody::decode(&aok.encode()).unwrap(), aok);
 

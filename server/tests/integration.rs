@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 // reuse the workspace's protocol crate for frame encoding/decoding
 // this is the actual protocol logic — the test verifies that the server speaks it correctly
-use protocol::{self, ConvsRespBody, HelloReq, MsgType, OwnedFrame, Payload, SendReq, Decode};
+use protocol::{self, ConvEntry, ConvsRespBody, HelloReq, MsgType, OwnedFrame, Payload, SendReq, Decode};
 
 // helpers
 
@@ -265,7 +265,14 @@ fn test_create_conv_and_send() {
     alice.send_frame(MsgType::CreateConv, 0, b"alice,bob");
     let created = alice.recv_frame();
     assert_eq!(created.msg_type, MsgType::ConvCreated);
-    let conv_id = created.body.to_vec();
+    // the reply carries the member list, not just the id, so the creating
+    // client can label the conversation without another round trip
+    let entry = ConvEntry::decode(&created.body).expect("ConvCreated carries a record");
+    let mut created_members: Vec<String> =
+        entry.members.iter().map(|m| String::from_utf8_lossy(m).into_owned()).collect();
+    created_members.sort();
+    assert_eq!(created_members, vec!["alice".to_string(), "bob".to_string()]);
+    let conv_id = entry.id;
 
     // send a message to the conversation
     let msg = SendReq { conv: conv_id.clone(), text: b"Hello, Bob!".to_vec() }.encode();
@@ -292,7 +299,14 @@ fn test_list_convs_returns_member_names() {
     alice.send_frame(MsgType::CreateConv, 0, b"alice,bob");
     let created = alice.recv_frame();
     assert_eq!(created.msg_type, MsgType::ConvCreated);
-    let conv_id = created.body.to_vec();
+    // the reply carries the member list, not just the id, so the creating
+    // client can label the conversation without another round trip
+    let entry = ConvEntry::decode(&created.body).expect("ConvCreated carries a record");
+    let mut created_members: Vec<String> =
+        entry.members.iter().map(|m| String::from_utf8_lossy(m).into_owned()).collect();
+    created_members.sort();
+    assert_eq!(created_members, vec!["alice".to_string(), "bob".to_string()]);
+    let conv_id = entry.id;
 
     alice.send_frame(MsgType::ListConvs, 0, b"");
     let resp = alice.recv_frame();
