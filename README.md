@@ -37,6 +37,13 @@ offloaded to a background thread.
 
 Requires a stable Rust toolchain (workspace `edition = "2024"`).
 
+On NixOS the C toolchain comes from the Nix store and is only on `PATH` inside
+an interactive shell, so `.cargo/config.toml` names the gcc wrapper as the
+linker. That keeps `cargo build` working from an IDE task runner, a GUI-launched
+terminal, a container or CI, all of which otherwise fail with
+`error: linker 'cc' not found`. If you are on a different Nix hash, update the
+`linker` path in `.cargo/config.toml`.
+
 ```sh
 cargo build --release
 # run the server
