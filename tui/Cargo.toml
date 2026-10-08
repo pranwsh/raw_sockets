@@ -3,7 +3,7 @@ name = "msgtui"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "reusable term_render-based chat TUI frontend (generic over a ChatClient trait)"
+description = "reusable ratatui chat TUI frontend (generic over a ChatClient trait)"
 # `src/bin/tui_client.rs` is a module of the `msgtui` bin, not its own binary.
 autobins = false
 
@@ -15,13 +15,9 @@ name = "msgtui"
 path = "src/bin/msgtui.rs"
 
 [dependencies]
-# term_render 0.1.3 on crates.io doesn't compile unmodified (its
-# term_render_macros proc-macro lacks syn's "full" feature), so we vendor both
-# crates under vendor/ and depend on them by path.
-term_render = { path = "vendor/term_render" }
+ratatui = "0.30"
 chat-model = { path = "../chat-model" }
 hex = "0.4"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 # Used only by the `msgtui` binary (src/bin/) to connect to the server; the
 # `msgtui` lib itself stays free of any wire knowledge.

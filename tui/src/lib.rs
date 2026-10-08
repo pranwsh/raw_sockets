@@ -1,19 +1,65 @@
-//! A reusable, term_render-based chat TUI frontend.
+//! A reusable, ratatui-based chat TUI frontend.
 //!
-//! This crate is a *pure frontend*: it owns the screen and keyboard, and it
-//! speaks the shared messaging model ([`chat_model::Action`]/[`chat_model::Event`])
-//! to an application-supplied [`ChatClient`]. It has no knowledge of any
-//! particular wire protocol. An app wires itself in by implementing
-//! [`ChatClient`] and calling [`run_app`].
+//! This crate is a *pure frontend*: it owns the screen and the keyboard and
+//! speaks the shared messaging model ([`chat_model::Action`] /
+//! [`chat_model::Event`]) to an application-supplied [`ChatClient`]. It has no
+//! knowledge of any particular wire protocol. An app wires itself in by
+//! implementing [`ChatClient`] and calling [`run_app`].
 //!
 //! See the `msgtui` binary (`src/bin/msgtui.rs`) in this crate for a reference
 //! integration that adapts this trait to its `msgclient` channel client.
+//!
+//! # Layout
+//!
+//! ```text
+//! ┌──────────────┬────────────────────────────────┐
+//! │ conversations│  transcript                    │
+//! │  ▌● alice,bob│  12:04 ▸ me: hello             │
+//! │    hey there │  12:05   bob: hi               │
+//! ├──────────────┴────────────────────────────────┤
+//! │ > message…                                   │
+//! ├───────────────────────────────────────────────┤
+//! │ ● online auth alice            Tab focus  …   │
+//! └───────────────────────────────────────────────┘
+//! ```
+//!
+//! # Key bindings
+//!
+//! | key | action |
+//! |---|---|
+//! | `Tab` / `Shift+Tab` | cycle focus sidebar → messages → composer |
+//! | `↑` / `↓` | move the sidebar cursor / scroll the transcript |
+//! | `Enter` | open the highlighted conversation, or send the composer line |
+//! | `PageUp` / `PageDown` | scroll the transcript |
+//! | `End` | jump to the newest message |
+//! | `Ctrl+U` | clear the composer |
+//! | `Ctrl+W` | delete the previous word |
+//! | `Esc` | close the overlay / clear focus, else quit |
+//! | `Ctrl+C` | quit |
+//!
+//! Slash commands typed into the composer: `/login`, `/logout`, `/create a,b`,
+//! `/new`, `/list`, `/filter`, `/ping`, `/quit`.
+
+pub mod render;
+pub mod state;
+pub mod util;
 
 use chat_model::{Action, Event};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode as CtKey,
+    KeyEvent, KeyEventKind, KeyModifiers,
+};
+use ratatui::crossterm::execute;
 use std::io;
-use term_render::event_handler::KeyCode;
-use term_render::render::{Colorize, ColorType, Span, Window};
-use tokio::runtime::Runtime;
+use std::time::{Duration, Instant};
+
+use state::{Focus, LoginField, Overlay, State};
+
+/// how long to block waiting for a key before waking anyway
+///
+/// Bounded so a background event (an inbound message, a status timeout) is
+/// reflected promptly without spinning on `poll`.
+const TICK: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // client contract
@@ -21,13 +67,14 @@ use tokio::runtime::Runtime;
 /// The adapter the app implements so the TUI never touches the wire.
 ///
 /// All socket I/O, framing, and protocol live behind this trait. The TUI
-/// drives it by calling [`send`](ChatClient::send) and periodically draining
-/// [`poll_events`](ChatClient::poll_events) on each rendered frame.
+/// drives it by calling [`send`](ChatClient::send) and draining
+/// [`drain_events`](ChatClient::drain_events) on each iteration.
 pub trait ChatClient: std::fmt::Debug {
     /// enqueue an action; returns false if the connection is gone
     fn send(&self, action: Action) -> bool;
-    /// drain any pending events into a `Vec` (non-blocking)
-    fn poll_events(&self) -> Vec<Event>;
+    /// drain any pending events into `out` (non-blocking), reusing its
+    /// allocation; returns how many were drained
+    fn drain_events(&self, out: &mut Vec<Event>) -> usize;
 }
 
 // ---------------------------------------------------------------------------
@@ -35,53 +82,108 @@ pub trait ChatClient: std::fmt::Debug {
 
 /// Launch the TUI with the supplied client adapter.
 ///
-/// `client` provides the connection; `user`/`password` cause an initial
-/// [`Action::Hello`] (skip by passing empty strings); `conv_hex` optionally
-/// pre-seeds a conversation (hex-encoded id) and selects it.
+/// `client` provides the connection; a non-empty `user` causes an immediate
+/// [`Action::Hello`]; `conv_hex` optionally pre-selects a conversation
+/// (hex-encoded id).
 ///
-/// This blocks until the user quits (Esc or `/quit`), running the term_render
-/// event/render loop on a tokio runtime.
+/// This blocks until the user quits (`Ctrl+C`, `Esc`, or `/quit`), restoring
+/// the terminal on the way out.
 pub fn run_app(
     client: Box<dyn ChatClient>,
     user: &str,
     password: &str,
     conv_hex: Option<&str>,
 ) -> io::Result<()> {
+    let mut state = State::new();
+    state.login_user = user.to_string();
+    state.login_pass = password.to_string();
+
     if !user.is_empty() {
-        let _ = client.send(Action::Hello { user: user.to_string(), password: password.to_string() });
+        state.me = user.to_string();
+        state.authenticated = true;
+        let ok = client.send(Action::Hello {
+            user: user.to_string(),
+            password: password.to_string(),
+        });
+        if !ok {
+            state.warn("failed to queue login");
+        }
+    } else {
+        // no credentials supplied: ask for them instead of silently idling
+        state.overlay = Overlay::Login;
+        state.note("press Enter to sign in");
     }
 
-    let mut ui = UiState {
-        connected: true,
-        authenticated: false,
-        user: user.to_string(),
-        convs: Vec::new(),
-        selected: None,
-        focus: Focus::Input,
-        input: String::new(),
-        status: if user.is_empty() { "no credentials given".into() } else { "authenticating...".into() },
-        quit: false,
-        dirty: true,
-    };
-    if let Some(id) = decode_conv_hex_opt(conv_hex) {
-        ui.convs.push(Conv::new(id));
-        ui.selected = Some(0);
+    if let Some(id) = decode_conv_hex(conv_hex) {
+        state.seed_conv(id);
     }
 
-    let data = AppData { client: Some(client), ui };
-    let rt = Runtime::new()?;
-    rt.block_on(async {
-        let mut app = term_render::App::<AppData>::new()?;
-        build_windows(&mut app);
-        let _ = app.run(data, tick).await;
-        Ok::<(), io::Error>(())
-    })
+    // the anchor for turning relative Instant ages into wall-clock times
+    let epoch_base = Instant::now();
+
+    let result = run_loop(client.as_ref(), &mut state, epoch_base);
+    // best effort: tell the server we are going away
+    client.send(Action::Goodbye);
+    result
 }
 
-// decode an optional hex conversation id; returns None for "" or malformed hex
-fn decode_conv_hex_opt(conv_hex: Option<&str>) -> Option<Vec<u8>> {
-    let h = conv_hex?;
-    let h = h.trim();
+/// the terminal event/render loop
+fn run_loop(
+    client: &dyn ChatClient,
+    state: &mut State,
+    epoch_base: Instant,
+) -> io::Result<()> {
+    let mut terminal = ratatui::init();
+    // mouse reporting is only used for scroll wheel support
+    let _ = execute!(terminal.backend_mut(), EnableMouseCapture);
+
+    let mut events: Vec<Event> = Vec::new();
+    let mut quit = false;
+
+    while !quit {
+        // 1. drain client events (reuses `events`, so no per-tick allocation)
+        events.clear();
+        if client.drain_events(&mut events) > 0 {
+            for ev in events.drain(..) {
+                state.apply(ev);
+            }
+            state.dirty = true;
+        }
+
+        // 2. wait for a key, bounded so redraws stay responsive
+        if event::poll(TICK)? {
+            match event::read()? {
+                CtEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                    if handle_key(client, state, key) {
+                        quit = true;
+                    }
+                }
+                CtEvent::Resize(_, _) => state.dirty = true,
+                _ => {}
+            }
+        }
+
+        // 3. clear an expired status so the bar does not linger
+        if state.status.as_ref().is_some_and(|s| s.is_stale()) {
+            state.status = None;
+            state.dirty = true;
+        }
+
+        // 4. draw, but only when something changed
+        if state.dirty || state.overlay != Overlay::None {
+            terminal.draw(|frame| render::draw(frame, state, epoch_base))?;
+            state.dirty = false;
+        }
+    }
+
+    let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
+    ratatui::restore();
+    Ok(())
+}
+
+/// decode a hex conversation id; returns `None` for empty or malformed input
+fn decode_conv_hex(conv_hex: Option<&str>) -> Option<Vec<u8>> {
+    let h = conv_hex?.trim();
     if h.is_empty() {
         return None;
     }
@@ -89,442 +191,335 @@ fn decode_conv_hex_opt(conv_hex: Option<&str>) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// app state
+// input handling
 
-#[derive(Debug)]
-struct AppData {
-    client: Option<Box<dyn ChatClient>>,
-    ui: UiState,
-}
-
-#[derive(Debug)]
-struct UiState {
-    connected: bool,
-    authenticated: bool,
-    user: String,
-    convs: Vec<Conv>,
-    selected: Option<usize>,
-    focus: Focus,
-    input: String,
-    status: String,
-    quit: bool,
-    dirty: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Input,
-    Convs,
-}
-
-#[derive(Debug)]
-struct Conv {
-    id: Vec<u8>,
-    label: String,
-    messages: Vec<Message>,
-}
-
-impl Conv {
-    fn new(id: Vec<u8>) -> Self {
-        let label = hex::encode(&id);
-        let label = if label.len() > 8 { label[..8].to_string() } else { label };
-        Conv { id, label, messages: Vec::new() }
-    }
-}
-
-#[derive(Debug)]
-struct Message {
-    from: String,
-    text: String,
-}
-
-// ---------------------------------------------------------------------------
-// per-frame callback (called by term_render every ~10ms)
-
-fn tick(data: &mut AppData, app: &mut term_render::App<AppData>) -> Result<bool, ()> {
-    // 1. consume client events
-    let pending: Vec<Event> = match data.client.as_ref() {
-        Some(client) => client.poll_events(),
-        None => Vec::new(),
-    };
-    for ev in pending {
-        apply_event(data, ev);
-    }
-
-    // 2. keyboard
-    if handle_keys(data, app) {
-        data.ui.quit = true;
-    }
-    if data.ui.quit {
-        if let Some(c) = data.client.take() {
-            let _ = c.send(Action::Goodbye);
-        }
-        return Ok(true);
-    }
-
-    // 3. render
-    render(data, app);
-
-    Ok(false)
-}
-
-fn apply_event(data: &mut AppData, ev: Event) {
-    match ev {
-        Event::Connected => {
-            data.ui.connected = true;
-            data.ui.dirty = true;
-        }
-        Event::AuthOk { created } => {
-            data.ui.authenticated = true;
-            data.ui.status = if created { "authenticated (new account)".into() } else { "authenticated".into() };
-            if let Some(c) = data.client.as_ref() {
-                c.send(Action::ListConvs);
-            }
-            data.ui.dirty = true;
-        }
-        Event::AuthFail { reason } => {
-            data.ui.authenticated = false;
-            data.ui.status = format!("auth failed: {reason}");
-            data.ui.dirty = true;
-        }
-        Event::ConvCreated { id } => {
-            let idx = match data.ui.convs.iter().position(|c| c.id == id) {
-                Some(i) => i,
-                None => {
-                    data.ui.convs.push(Conv::new(id));
-                    data.ui.convs.len() - 1
-                }
-            };
-            data.ui.selected = Some(idx);
-            data.ui.focus = Focus::Input;
-            data.ui.status = "conversation created".into();
-            data.ui.dirty = true;
-        }
-        Event::Convs { ids } => {
-            for id in ids {
-                if !data.ui.convs.iter().any(|c| c.id == id) {
-                    data.ui.convs.push(Conv::new(id));
-                }
-            }
-            if data.ui.selected.is_none() && !data.ui.convs.is_empty() {
-                data.ui.selected = Some(0);
-            }
-            data.ui.status = format!("{} conversations", data.ui.convs.len());
-            data.ui.dirty = true;
-        }
-        Event::Message { conv, from, text, .. } => {
-            let idx = match data.ui.convs.iter().position(|c| c.id == conv) {
-                Some(i) => i,
-                None => {
-                    data.ui.convs.push(Conv::new(conv));
-                    data.ui.convs.len() - 1
-                }
-            };
-            data.ui.convs[idx].messages.push(Message { from, text });
-            // jump to a conversation that just received a message so inbound
-            // messages are immediately visible without manual navigation
-            if data.ui.selected.is_none() {
-                data.ui.selected = Some(idx);
-            }
-            data.ui.dirty = true;
-        }
-        Event::Delivered { seq } => {
-            data.ui.status = format!("delivered (seq {seq})");
-            data.ui.dirty = true;
-        }
-        Event::Pong => {
-            data.ui.status = "pong".into();
-            data.ui.dirty = true;
-        }
-        Event::Error { msg } => {
-            data.ui.status = format!("error: {msg}");
-            data.ui.dirty = true;
-        }
-        Event::Disconnected { reason } => {
-            data.ui.connected = false;
-            data.ui.authenticated = false;
-            data.ui.status = format!("disconnected: {reason}");
-            data.ui.dirty = true;
-        }
-    }
-}
-
-fn handle_keys(data: &mut AppData, app: &mut term_render::App<AppData>) -> bool {
-    let events = app.events.read();
-
-    if events.contains_key_code(KeyCode::Escape) {
+/// Handle one key. Returns true when the app should quit.
+fn handle_key(client: &dyn ChatClient, state: &mut State, key: KeyEvent) -> bool {
+    // Ctrl+C always quits, whatever has focus
+    if key.code == CtKey::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
 
-    match data.ui.focus {
-        Focus::Input => {
-            for ch in &events.char_events {
-                data.ui.input.push(*ch);
-                data.ui.dirty = true;
-            }
-            if events.contains_key_code(KeyCode::Delete) {
-                data.ui.input.pop();
-                data.ui.dirty = true;
-            }
-            if events.contains_key_code(KeyCode::Return) {
-                let line = data.ui.input.trim().to_string();
-                data.ui.input.clear();
-                data.ui.dirty = true;
-                submit(data, &line);
-            }
-        }
-        Focus::Convs => {
-            if events.contains_key_code(KeyCode::Up) {
-                move_sel(data, -1);
-            }
-            if events.contains_key_code(KeyCode::Down) {
-                move_sel(data, 1);
-            }
-            if events.contains_key_code(KeyCode::Return) && data.ui.selected.is_some() {
-                data.ui.focus = Focus::Input;
-                data.ui.dirty = true;
-            }
-        }
+    // overlays capture all input except Esc (and Ctrl+C, handled above)
+    match state.overlay {
+        Overlay::Login => return handle_login_key(client, state, key),
+        Overlay::NewConv => return handle_new_conv_key(client, state, key),
+        Overlay::Filter => return handle_filter_key(state, key),
+        Overlay::None => {}
     }
 
-    if events.contains_key_code(KeyCode::Tab) {
-        data.ui.focus = match data.ui.focus {
-            Focus::Input => Focus::Convs,
-            Focus::Convs => Focus::Input,
-        };
-        data.ui.dirty = true;
+    match key.code {
+        CtKey::Esc => {
+            // Esc drops composer focus first, then quits
+            if state.focus != Focus::Composer || !state.input.is_empty() {
+                state.input.clear();
+                state.focus = Focus::Sidebar;
+                state.dirty = true;
+                return false;
+            }
+            return true;
+        }
+        CtKey::Tab => {
+            state.focus = next_focus(state.focus, key.modifiers.contains(KeyModifiers::SHIFT));
+            state.dirty = true;
+        }
+        CtKey::BackTab => {
+            state.focus = next_focus(state.focus, true);
+            state.dirty = true;
+        }
+        CtKey::Up => match state.focus {
+            Focus::Composer => state.history_prev(),
+            _ => {
+                state.move_cursor(-1);
+                state.open_cursor_soft();
+            }
+        },
+        CtKey::Down => match state.focus {
+            Focus::Composer => state.history_next(),
+            _ => {
+                state.move_cursor(1);
+                state.open_cursor_soft();
+            }
+        },
+        CtKey::PageUp => {
+            state.scroll_by(10);
+            return false;
+        }
+        CtKey::PageDown => {
+            state.scroll_by_step(-10);
+            return false;
+        }
+        CtKey::Home | CtKey::End => {
+            state.scroll_to_bottom();
+            return false;
+        }
+        CtKey::Enter => {
+            if state.focus == Focus::Composer {
+                return submit_composer(client, state);
+            }
+            state.open_cursor();
+            return false;
+        }
+        CtKey::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.input.clear();
+            state.dirty = true;
+        }
+        CtKey::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            delete_word(&mut state.input);
+            state.dirty = true;
+        }
+        CtKey::Backspace => {
+            state.input.pop();
+            state.dirty = true;
+        }
+        CtKey::Char(c) => {
+            // a printable character returns to the composer: typing always types
+            state.focus = Focus::Composer;
+            state.input.push(c);
+            state.dirty = true;
+        }
+        _ => {}
     }
-
     false
 }
 
-fn move_sel(data: &mut AppData, delta: isize) {
-    let n = data.ui.convs.len();
-    if n == 0 {
-        return;
-    }
-    let cur = data.ui.selected.unwrap_or(0) as isize;
-    let next = (cur + delta).rem_euclid(n as isize) as usize;
-    data.ui.selected = Some(next);
-    data.ui.dirty = true;
+fn next_focus(current: Focus, backwards: bool) -> Focus {
+    const ORDER: [Focus; 3] = [Focus::Sidebar, Focus::Messages, Focus::Composer];
+    let i = ORDER.iter().position(|f| *f == current).unwrap_or(0);
+    let n = ORDER.len() as isize;
+    let next = if backwards { (i as isize - 1).rem_euclid(n) } else { (i as isize + 1) % n };
+    ORDER[next as usize]
 }
 
-fn submit(data: &mut AppData, line: &str) {
+/// Delete the word before the cursor.
+fn delete_word(input: &mut String) {
+    let trimmed = input.trim_end();
+    let cut = match trimmed.rfind(' ') {
+        Some(i) => i,
+        None => 0,
+    };
+    input.truncate(cut);
+}
+
+/// Handle the composer's Enter: run a command or send a message.
+fn submit_composer(client: &dyn ChatClient, state: &mut State) -> bool {
+    let raw = std::mem::take(&mut state.input);
+    let line = raw.trim().to_string();
     if line.is_empty() {
-        return;
+        return false;
     }
+    state.push_history(line.clone());
+
+    // commands are handled before the generic submit path so that actions like
+    // /quit and /login never fall through to the message path
     if let Some(cmd) = line.strip_prefix('/') {
-        let mut parts = cmd.splitn(2, ' ');
-        match parts.next().unwrap_or("") {
-            "create" => {
-                let members: Vec<String> = parts
-                    .next()
-                    .unwrap_or("")
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if members.is_empty() {
-                    data.ui.status = "usage: /create member1,member2".into();
-                } else if let Some(c) = data.client.as_ref() {
-                    c.send(Action::CreateConv { members });
-                    data.ui.status = "creating conversation...".into();
-                }
+        match cmd.split_whitespace().next().unwrap_or("") {
+            "q" | "quit" | "exit" => return true,
+            "login" => {
+                state.overlay = Overlay::Login;
+                state.login_field = LoginField::User;
+                state.dirty = true;
+                return false;
             }
-            "list" => {
-                if let Some(c) = data.client.as_ref() {
-                    c.send(Action::ListConvs);
-                    data.ui.status = "listing conversations...".into();
-                }
+            "logout" => {
+                client.send(Action::Goodbye);
+                state.warn("signed out");
+                return false;
             }
-            "ping" => {
-                if let Some(c) = data.client.as_ref() {
-                    c.send(Action::Ping);
-                    data.ui.status = "ping sent".into();
-                }
+            "new" => {
+                state.overlay = Overlay::NewConv;
+                state.draft_members.clear();
+                state.dirty = true;
+                return false;
             }
-            "quit" | "exit" => {
-                data.ui.quit = true;
+            "filter" => {
+                state.overlay = Overlay::Filter;
+                state.dirty = true;
+                return false;
             }
-            other => {
-                data.ui.status = format!("unknown command /{other}");
-            }
-        }
-        data.ui.dirty = true;
-        return;
-    }
-
-    match data.ui.selected {
-        Some(i) => {
-            let conv = data.ui.convs[i].id.clone();
-            if let Some(c) = data.client.as_ref() {
-                c.send(Action::Send { conv, text: line.to_string() });
-            }
-            // optimistic echo so the sender sees their own message immediately
-            data.ui.convs[i].messages.push(Message { from: data.ui.user.clone(), text: line.to_string() });
-            data.ui.status = "sent".into();
-        }
-        None => {
-            data.ui.status = "select a conversation first (Tab to convs)".into();
+            _ => {}
         }
     }
-    data.ui.dirty = true;
-}
 
-// ---------------------------------------------------------------------------
-// windows
-
-const INPUT_H: u16 = 3;
-const STATUS_H: u16 = 1;
-
-fn conv_width(w: u16) -> u16 {
-    // leave at least 4 columns for the messages pane on narrow terminals,
-    // so the convs pane never ends up wider than the screen
-    (w / 5).clamp(20, 32).min(w.saturating_sub(4).max(2))
-}
-
-fn body_height(h: u16) -> u16 {
-    h.saturating_sub(INPUT_H + STATUS_H).max(1)
-}
-
-fn build_windows(app: &mut term_render::App<AppData>) {
-    let (w, h) = {
-        let a = app.area.read();
-        (a.width, a.height)
-    };
-    let cw = conv_width(w);
-    let bh = body_height(h);
-
-    let mut renderer = app.renderer.write();
-    add_window(&mut renderer, "convs", (0, 0), (cw, bh), "conversations");
-    add_window(&mut renderer, "messages", (cw, 0), (w.saturating_sub(cw).max(1), bh), "messages");
-    add_window(&mut renderer, "input", (0, bh), (w, INPUT_H), "input");
-    add_window(&mut renderer, "status", (0, h.saturating_sub(STATUS_H)), (w, STATUS_H), "");
-}
-
-fn add_window(app: &mut term_render::render::App, name: &str, pos: (u16, u16), size: (u16, u16), title: &str) {
-    let bordered = name != "status";
-    // bordered windows need at least 2x2 for the border lines themselves
-    let size = if bordered { (size.0.max(2), size.1.max(2)) } else { (size.0.max(1), size.1.max(1)) };
-    let mut win = Window::new(pos, 0, size);
-    if bordered {
-        win.bordered();
-    }
-    if !title.is_empty() {
-        win.titled(title.to_string());
-    }
-    app.add_window(win, name.to_string(), vec![]);
-}
-
-fn render(data: &mut AppData, app: &mut term_render::App<AppData>) {
-    let (w, h) = {
-        let a = app.area.read();
-        (a.width, a.height)
-    };
-    let cw = conv_width(w);
-    let bh = body_height(h);
-
-    let mut renderer = app.renderer.write();
-    layout_window(&mut renderer, "convs", (0, 0), (cw, bh));
-    layout_window(&mut renderer, "messages", (cw, 0), (w.saturating_sub(cw), bh));
-    layout_window(&mut renderer, "input", (0, bh), (w, INPUT_H));
-    layout_window(&mut renderer, "status", (0, h.saturating_sub(STATUS_H)), (w, STATUS_H));
-
-    if !data.ui.dirty {
-        return;
-    }
-    data.ui.dirty = false;
-
-    render_convs(&mut renderer, data, bh);
-    render_messages(&mut renderer, data, bh);
-    render_input(&mut renderer, data);
-    render_status(&mut renderer, data);
-}
-
-fn layout_window(app: &mut term_render::render::App, name: &str, pos: (u16, u16), size: (u16, u16)) {
-    if !app.contains_window(name.into()) {
-        return;
-    }
-    // bordered windows need at least 2x2 for the border lines themselves
-    let size = if name == "status" {
-        (size.0.max(1), size.1.max(1))
-    } else {
-        (size.0.max(2), size.1.max(2))
-    };
-    let win = app.get_window_reference_mut(name.into());
-    win.resize(size);
-    win.r#move(pos);
-}
-
-fn content_height(bh: u16) -> usize {
-    bh.saturating_sub(2).max(1) as usize
-}
-
-fn render_convs(renderer: &mut term_render::render::App, data: &AppData, bh: u16) {
-    let height = content_height(bh);
-    let mut lines = Vec::new();
-    for (i, conv) in data.ui.convs.iter().take(height).enumerate() {
-        let sel = Some(i) == data.ui.selected;
-        let text = format!("{} {}  {}", if sel { ">" } else { " " }, conv.label, conv.messages.len());
-        let span = if sel {
-            Span::from_tokens(vec![text.colorize(ColorType::BrightYellow)])
-        } else {
-            Span::from_tokens(vec![text.colorizes(vec![])])
-        };
-        lines.push(span);
-    }
-    renderer.get_window_reference_mut("convs".into()).try_update_lines(lines);
-}
-
-fn render_messages(renderer: &mut term_render::render::App, data: &AppData, bh: u16) {
-    let height = content_height(bh);
-    let mut lines = Vec::new();
-    match data.ui.selected {
-        Some(i) => {
-            let msgs = &data.ui.convs[i].messages;
-            let start = msgs.len().saturating_sub(height);
-            for m in &msgs[start..] {
-                let own = m.from == data.ui.user;
-                let line = format!("{}: {}", m.from, m.text);
-                let span = if own {
-                    Span::from_tokens(vec![line.colorize(ColorType::BrightGreen)])
-                } else {
-                    Span::from_tokens(vec![line.colorizes(vec![])])
-                };
-                lines.push(span);
+    match state::submit(state, &line) {
+        Some(action) => {
+            if !client.send(action) {
+                state.warn("connection closed; action dropped");
+            } else {
+                state.note("sent");
             }
         }
         None => {
-            lines.push(Span::from_tokens(vec![
-                "no conversation selected".colorize(ColorType::BrightBlack),
-            ]));
+            // `/quit` reaches here as an unknown command; re-check it
+            if matches!(line.as_str(), "/quit" | "/exit") {
+                return true;
+            }
         }
     }
-    renderer.get_window_reference_mut("messages".into()).try_update_lines(lines);
+    state.dirty = true;
+    false
 }
 
-fn render_input(renderer: &mut term_render::render::App, data: &AppData) {
-    let cursor = if data.ui.focus == Focus::Input { "|" } else { "" };
-    let line = if data.ui.input.is_empty() {
-        if data.ui.focus == Focus::Input {
-            "type a message — /create a,b /list /ping /quit".to_string()
-        } else {
-            "press Tab to type".to_string()
+// --- filter overlay
+
+fn handle_filter_key(state: &mut State, key: KeyEvent) -> bool {
+    match key.code {
+        CtKey::Esc => {
+            state.overlay = Overlay::None;
+            state.filter.clear();
+            state.dirty = true;
         }
-    } else {
-        format!("{}{}", data.ui.input, cursor)
-    };
-    renderer.get_window_reference_mut("input".into()).try_update_lines(vec![Span::from_tokens(vec![line.colorizes(vec![])])]);
+        CtKey::Backspace => {
+            state.filter.pop();
+            state.dirty = true;
+        }
+        CtKey::Enter => {
+            state.overlay = Overlay::None;
+            state.focus = Focus::Sidebar;
+            state.dirty = true;
+        }
+        CtKey::Char(c) => {
+            state.filter.push(c);
+            state.dirty = true;
+        }
+        _ => {}
+    }
+    false
 }
 
-fn render_status(renderer: &mut term_render::render::App, data: &AppData) {
-    let conn = if data.ui.connected { "connected" } else { "disconnected" };
-    let auth = if data.ui.authenticated { "auth" } else { "no-auth" };
-    let conv = match data.ui.selected {
-        Some(i) => data.ui.convs[i].label.clone(),
-        None => "-".to_string(),
-    };
-    let line = format!("[{conn}] [{auth}] user={} conv={conv}  {status}", data.ui.user, status = data.ui.status);
-    renderer.get_window_reference_mut("status".into()).try_update_lines(vec![Span::from_tokens(vec![line.colorize(ColorType::BrightBlack)])]);
+// --- login overlay
+
+fn handle_login_key(client: &dyn ChatClient, state: &mut State, key: KeyEvent) -> bool {
+    match key.code {
+        CtKey::Esc => {
+            state.overlay = Overlay::None;
+            state.dirty = true;
+        }
+        CtKey::Tab | CtKey::BackTab => {
+            state.login_field = if state.login_field == LoginField::User {
+                LoginField::Password
+            } else {
+                LoginField::User
+            };
+            state.dirty = true;
+        }
+        CtKey::Backspace => {
+            match state.login_field {
+                LoginField::User => state.login_user.pop(),
+                LoginField::Password => state.login_pass.pop(),
+            };
+            state.dirty = true;
+        }
+        CtKey::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+N submits from either field
+            submit_login(client, state);
+        }
+        CtKey::Enter => {
+            // Enter moves between fields, and submits from the last one
+            if state.login_field == LoginField::User {
+                state.login_field = LoginField::Password;
+                state.dirty = true;
+            } else {
+                submit_login(client, state);
+            }
+        }
+        CtKey::Char(c) => match state.login_field {
+            LoginField::User => state.login_user.push(c),
+            LoginField::Password => state.login_pass.push(c),
+        },
+        _ => {}
+    }
+    false
+}
+
+fn submit_login(client: &dyn ChatClient, state: &mut State) {
+    if state.login_user.is_empty() {
+        state.warn("user id required");
+        return;
+    }
+    state.me = state.login_user.clone();
+    let ok = client.send(Action::Hello {
+        user: state.login_user.clone(),
+        password: std::mem::take(&mut state.login_pass),
+    });
+    state.overlay = Overlay::None;
+    state.login_pass.clear();
+    if ok {
+        state.note("authenticating…");
+    } else {
+        state.warn("connection closed");
+    }
+    state.dirty = true;
+}
+
+// --- new conversation overlay
+
+fn handle_new_conv_key(client: &dyn ChatClient, state: &mut State, key: KeyEvent) -> bool {
+    match key.code {
+        CtKey::Esc => {
+            state.overlay = Overlay::None;
+            state.draft_members.clear();
+            state.dirty = true;
+        }
+        CtKey::Backspace => {
+            state.draft_members.pop();
+            state.dirty = true;
+        }
+        CtKey::Enter => {
+            let members: Vec<String> = state
+                .draft_members
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            state.overlay = Overlay::None;
+            state.draft_members.clear();
+            if members.is_empty() {
+                state.warn("need at least one other member");
+            } else if client.send(Action::CreateConv { members }) {
+                state.note("creating conversation…");
+            } else {
+                state.warn("connection closed");
+            }
+            state.dirty = true;
+        }
+        CtKey::Char(c) => {
+            state.draft_members.push(c);
+            state.dirty = true;
+        }
+        _ => {}
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_hex_conv_ids() {
+        assert_eq!(decode_conv_hex(Some("a1b2")), Some(vec![0xa1, 0xb2]));
+        assert_eq!(decode_conv_hex(Some("")), None);
+        assert_eq!(decode_conv_hex(None), None);
+        assert_eq!(decode_conv_hex(Some("zz")), None);
+    }
+
+    #[test]
+    fn focus_cycles_both_ways() {
+        assert_eq!(next_focus(Focus::Composer, false), Focus::Sidebar);
+        assert_eq!(next_focus(Focus::Sidebar, false), Focus::Messages);
+        assert_eq!(next_focus(Focus::Sidebar, true), Focus::Composer);
+    }
+
+    #[test]
+    fn deletes_previous_word() {
+        let mut s = String::from("hello brave world");
+        delete_word(&mut s);
+        assert_eq!(s, "hello brave");
+        delete_word(&mut s);
+        assert_eq!(s, "hello");
+        delete_word(&mut s);
+        assert_eq!(s, "");
+    }
 }

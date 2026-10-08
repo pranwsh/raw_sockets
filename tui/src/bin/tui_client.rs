@@ -32,7 +32,7 @@ impl ChatClient for TuiClient {
         self.client.send(action)
     }
 
-    fn poll_events(&self) -> Vec<Event> {
-        self.client.events().try_iter().collect()
+    fn drain_events(&self, out: &mut Vec<Event>) -> usize {
+        self.client.drain_events(out)
     }
 }
