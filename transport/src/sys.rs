@@ -259,6 +259,173 @@ pub fn epoll_wait(epfd: RawFd, events: &mut [libc::epoll_event], timeout_ms: c_i
     }
 }
 
+// raw ip socket — the datagram transport's network layer
+//
+// The server owns its own IPv4/UDP headers (`packet` module) and hands the
+// kernel a complete packet via `IP_HDRINCL`. That requires `CAP_NET_RAW`, so
+// every function here can fail with EPERM on a host without the capability.
+
+/// create a raw IPv4 socket for datagrams (`SOCK_RAW` + `IPPROTO_RAW`)
+///
+/// With `IPPROTO_RAW` the protocol is taken from each packet's IP header, so one
+/// socket can carry every protocol. Requires `CAP_NET_RAW`.
+pub fn socket_raw_ipv4() -> io::Result<RawFd> {
+    let fd = unsafe {
+        // SAFETY: socket() allocates a descriptor and returns it; IPPROTO_RAW
+        // defers the protocol to the per-packet IP header, so the kernel does
+        // not filter by protocol here.
+        libc::socket(
+            libc::AF_INET,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            libc::IPPROTO_RAW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+/// enable `IP_HDRINCL` so the caller supplies the IP header
+///
+/// Without this the kernel refuses packets and overwrites the header.
+pub fn set_ip_hdrincl(fd: RawFd) -> io::Result<()> {
+    let optval: c_int = 1;
+    let rc = unsafe {
+        // SAFETY: setsockopt with IPPROTO_IP/IP_HDRINCL writes an int-sized
+        // option; valid fd and valid pointer to optval.
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_HDRINCL,
+            &optval as *const _ as *const c_void,
+            std::mem::size_of_val(&optval) as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// build a `sockaddr_in` for an IPv4 endpoint
+///
+/// `sin_addr.s_addr` holds the four address octets in **network byte order in
+/// memory**, which is what the kernel reads. `Endpoint::addr` is already in
+/// network byte order as a number, so it must be byte-swapped once here:
+/// assigning it directly writes the octets in reverse on a little-endian host
+/// and the kernel reports `EADDRNOTAVAIL`.
+///
+/// Use this rather than constructing the struct inline; getting the order wrong
+/// is silent until a bind or send fails.
+pub fn sockaddr_v4(addr: u32, port: u16) -> libc::sockaddr_in {
+    libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr { s_addr: addr.to_be() },
+        sin_zero: [0u8; 8],
+    }
+}
+
+/// bind a raw socket to a local IPv4 address/port
+///
+/// Unlike a stream socket this does not reserve the port exclusively, so it is
+/// not a substitute for `listen`.
+pub fn bind_raw_v4(fd: RawFd, addr: &libc::sockaddr_in) -> io::Result<()> {
+    let rc = unsafe {
+        // SAFETY: bind reads the address; valid fd and valid addr pointer.
+        libc::bind(
+            fd,
+            addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of_val(addr) as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// send one complete IPv4 packet to `addr`
+///
+/// Returns the number of bytes the kernel accepted, which is the whole packet
+/// on success. `EMSGSIZE` means it exceeded the interface MTU and must be
+/// fragmented by the caller (see `packet::encode_datagram`).
+pub fn send_packet(fd: RawFd, packet: &[u8], addr: &libc::sockaddr_in) -> io::Result<usize> {
+    loop {
+        let rc = unsafe {
+            // SAFETY: send_packet reads from `packet` and writes no memory.
+            libc::sendto(
+                fd,
+                packet.as_ptr() as *const c_void,
+                packet.len() as size_t,
+                0,
+                addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of_val(addr) as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(rc as usize);
+    }
+}
+
+/// receive one packet, reporting the sender in `from`
+///
+/// `MSG_TRUNC` is passed so the return value is the REAL datagram size even when
+/// it did not fit the buffer — without it a truncated datagram is
+/// indistinguishable from a small one, and the frame would be silently corrupt.
+pub fn recv_packet(fd: RawFd, buf: &mut [u8], from: &mut libc::sockaddr_in) -> io::Result<usize> {
+    loop {
+        let mut fromlen = std::mem::size_of_val(from) as libc::socklen_t;
+        let rc = unsafe {
+            // SAFETY: recv_packet writes at most buf.len() bytes into buf and up
+            // to fromlen bytes into `from`, whose size we pass in.
+            libc::recvfrom(
+                fd,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len() as size_t,
+                libc::MSG_TRUNC,
+                from as *mut _ as *mut libc::sockaddr,
+                &mut fromlen,
+            )
+        };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        return Ok(rc as usize);
+    }
+}
+
+/// set the outgoing interface MTU hint used when choosing fragment size
+pub fn set_mtu_discover(fd: RawFd) -> io::Result<()> {
+    let optval: c_int = libc::IP_PMTUDISC_DO;
+    let rc = unsafe {
+        // SAFETY: setsockopt with IPPROTO_IP/IP_MTU_DISCOVER writes an int-sized
+        // option; valid fd and valid pointer to optval.
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            &optval as *const _ as *const c_void,
+            std::mem::size_of_val(&optval) as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 // eventfd wakeup — lets the store worker nudge the reactor's epoll loop so
 // async results are observed immediately instead of after the epoll_wait
 // timeout. The single fd is both the readable side (registered with epoll) and

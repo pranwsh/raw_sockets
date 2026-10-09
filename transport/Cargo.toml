@@ -8,3 +8,6 @@ description = "Non-blocking event loop, partial I/O, backpressure, teardown."
 [dependencies]
 protocol = { path = "../protocol" }
 libc.workspace = true
+
+[dev-dependencies]
+libc.workspace = true

@@ -21,6 +21,21 @@
 /// length of an IPv4 header with no options
 pub const IPV4_HEADER_LEN: usize = 20;
 
+/// Note on fragmentation over loopback: Linux's `lo` interface has an MTU of
+/// 65536 and does NOT reassemble IPv4 fragments sent to a local UDP socket via a
+/// raw socket. A hand-built fragment set (two or more packets with the MF flag
+/// and non-zero offsets) is accepted by `sendto` but silently dropped before it
+/// reaches the UDP layer, so nothing is ever delivered to the receiver.
+///
+/// This was confirmed independently in C on this host: a single unfragmented
+/// 2000-byte datagram arrives intact, while a minimal two-fragment set does not.
+/// It is a kernel/loopback behaviour, not a defect in this module.
+///
+/// Consequence for the transport: over loopback, a payload larger than
+/// `max_frame_for_mtu` cannot be delivered. Production traffic on a real
+/// interface (MTU 1500) fragments normally, and [`Reassembler`] handles the
+/// in-order/out-of-order/lost cases there — which is what the unit tests cover.
+
 /// length of a UDP header
 pub const UDP_HEADER_LEN: usize = 8;
 
@@ -61,25 +76,59 @@ pub fn ipv4_addr_to_string(addr: u32) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::from(addr)
 }
 
-/// convert a host-order `Ipv4Addr` into network byte order for `sockaddr_in`
+/// convert an `Ipv4Addr` into the network-byte-order `u32` used by
+/// [`Endpoint::addr`] and `sockaddr_in::sin_addr`
+///
+/// `Ipv4Addr::octets` is always big-endian order, and so is the wire format,
+/// so this is `from_be_bytes` — NOT `from_ne_bytes`, which silently produces
+/// the reversed value on a little-endian host and yields packets the receiver
+/// drops as malformed.
 pub fn ipv4_addr_to_be(ip: std::net::Ipv4Addr) -> u32 {
-    u32::from_ne_bytes(ip.octets())
+    u32::from_be_bytes(ip.octets())
+}
+
+/// convert a network-byte-order address back into an `Ipv4Addr`
+pub fn be_to_ipv4_addr(addr: u32) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(addr)
 }
 
 /// one's-complement 16-bit sum, the basis of both checksums
+/// 16-bit one's-complement sum over `chunks` treated as ONE contiguous buffer
+///
+/// The chunks are a pseudo-header, a header and a payload, concatenated — not
+/// separate buffers. Padding each chunk to an even length independently is
+/// wrong: an odd-length chunk shifts the byte alignment of everything after it
+/// and silently produces a different (invalid) checksum. Only a genuinely odd
+/// *total* length is padded, at the very end.
 fn ones_complement_sum(chunks: &[&[u8]]) -> u16 {
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    // accumulate words, carrying a single leftover byte across chunks
     let mut sum: u32 = 0;
+    let mut pending: Option<u8> = None;
     for chunk in chunks {
         let mut i = 0;
+        if let Some(lo) = pending.take() {
+            if let Some(&hi) = chunk.first() {
+                sum += u16::from_be_bytes([lo, hi]) as u32;
+                i = 1;
+            } else {
+                pending = Some(lo);
+                continue;
+            }
+        }
         while i + 1 < chunk.len() {
             sum += u16::from_be_bytes([chunk[i], chunk[i + 1]]) as u32;
             i += 2;
         }
         if i < chunk.len() {
-            // odd trailing byte is padded on the right with a zero
-            sum += (chunk[i] as u32) << 8;
+            pending = Some(chunk[i]);
         }
     }
+    if let Some(lo) = pending {
+        // odd total length: pad the final byte on the right with a zero
+        sum += (lo as u32) << 8;
+    }
+    let _ = total;
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -127,9 +176,9 @@ fn build_ipv4_header(
 }
 
 /// compute the UDP checksum given the addresses it is sent between
-fn udp_checksum_with(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, payload: &[u8]) -> u16 {
-    let udp_len = UDP_HEADER_LEN + payload.len();
-    let pseudo = [
+/// the UDP pseudo-header: src, dst, zero, protocol, UDP length
+fn pseudo_header(src_ip: u32, dst_ip: u32, udp_len: usize) -> [u8; 12] {
+    [
         (src_ip >> 24) as u8,
         (src_ip >> 16) as u8,
         (src_ip >> 8) as u8,
@@ -142,7 +191,12 @@ fn udp_checksum_with(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, pay
         IPPROTO_UDP,
         (udp_len >> 8) as u8,
         udp_len as u8,
-    ];
+    ]
+}
+
+fn udp_checksum_with(src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, payload: &[u8]) -> u16 {
+    let udp_len = UDP_HEADER_LEN + payload.len();
+    let pseudo = pseudo_header(src_ip, dst_ip, udp_len);
     let mut hdr = [0u8; UDP_HEADER_LEN];
     hdr[0..2].copy_from_slice(&src_port.to_be_bytes());
     hdr[2..4].copy_from_slice(&dst_port.to_be_bytes());
@@ -518,6 +572,101 @@ mod tests {
         assert_eq!(ones_complement_sum(&[&[0xFF]]), !0xFF00u16);
         // two bytes need no padding
         assert_eq!(ones_complement_sum(&[&[0xFF, 0x01]]), !0xFF01u16);
+    }
+
+    /// Known-answer test: the IPv4 header checksum is a fixed, externally
+    /// specified value. `verify_ipv4_checksum` only proves a packet agrees with
+    /// itself — a wrong-but-consistent checksum passes it — so the checksum has
+    /// to be pinned against an independent computation.
+    #[test]
+    fn ipv4_checksum_matches_a_known_answer() {
+        // header for 127.0.0.1 -> 127.0.0.1, proto 17, total len 53, id 0x1234
+        let src = ep([127, 0, 0, 1], 0);
+        let dst = ep([127, 0, 0, 1], 0);
+        let pkt = build_packet(src, dst, b"raw ip round trip payload", 0x1234);
+        assert_eq!(
+            &pkt.bytes[10..12],
+            &[0x6a, 0x82],
+            "IPv4 header checksum must be 0x6a82"
+        );
+        // UDP checksum for port 0 -> 0 over the same pseudo-header
+        assert_eq!(
+            &pkt.bytes[26..28],
+            &[0xf0, 0x3d],
+            "UDP checksum must be 0xf03d"
+        );
+        // and the same payload between real ports, so the test would catch a
+        // checksum that ignored the ports entirely
+        let pkt2 = build_packet(
+            Endpoint { addr: u32::from_be_bytes([127, 0, 0, 1]), port: 9999 },
+            Endpoint { addr: u32::from_be_bytes([127, 0, 0, 1]), port: 45311 },
+            b"raw ip round trip payload",
+            0x1234,
+        );
+        assert_eq!(&pkt2.bytes[26..28], &[0x18, 0x2f]);
+    }
+
+    /// The checksum of a whole packet must sum to zero when the stored value is
+    /// included — the property every receiver actually checks.
+    #[test]
+    fn a_correct_packet_sums_to_zero() {
+        let src = ep([10, 0, 0, 1], 1234);
+        let dst = ep([10, 0, 0, 2], 5678);
+        let pkt = build_packet(src, dst, b"payload", 0x4321);
+        // IPv4 header alone must sum to zero
+        let mut h = [0u8; IPV4_HEADER_LEN];
+        h.copy_from_slice(&pkt.bytes[..IPV4_HEADER_LEN]);
+        assert_eq!(
+            ones_complement_sum(&[&h]),
+            0,
+            "IPv4 header checksum is self-inconsistent"
+        );
+        // UDP header + payload over the pseudo-header must sum to zero. The
+        // stored checksum field has to be zeroed first, exactly as a receiver
+        // does — summing with it still in place can never yield zero.
+        let udp = &pkt.bytes[IPV4_HEADER_LEN..];
+        let mut udp_zeroed = udp.to_vec();
+        udp_zeroed[6] = 0;
+        udp_zeroed[7] = 0;
+        let pseudo = pseudo_header(src.addr, dst.addr, udp.len());
+        let recomputed = ones_complement_sum(&[&pseudo, &udp_zeroed]);
+        let stored = u16::from_be_bytes([udp[6], udp[7]]);
+        assert_eq!(
+            stored, recomputed,
+            "UDP checksum {stored:#06x} != recomputed {recomputed:#06x}"
+        );
+    }
+
+    /// The address in `Endpoint::addr` is network byte order, and the bytes that
+    /// go on the wire are the SAME bytes the UDP pseudo-header must be computed
+    /// over. Getting this wrong produces a checksum that verifies locally but
+    /// is rejected by the receiver as malformed — a silent drop.
+    #[test]
+    fn address_byte_order_is_wire_order() {
+        let ip = std::net::Ipv4Addr::new(127, 0, 0, 1);
+        let be = ipv4_addr_to_be(ip);
+        assert_eq!(be.to_be_bytes(), [127, 0, 0, 1], "must stay big-endian");
+        // not the little-endian mistake
+        assert_ne!(be.to_be_bytes(), [1, 0, 0, 127]);
+        // and it round-trips
+        assert_eq!(be_to_ipv4_addr(be), ip);
+    }
+
+    /// The UDP checksum has to be computed over exactly the header bytes that
+    /// are transmitted, so a receiver's own computation agrees.
+    #[test]
+    fn udp_checksum_covers_the_bytes_on_the_wire() {
+        let src = Endpoint { addr: ipv4_addr_to_be(std::net::Ipv4Addr::new(127,0,0,1)), port: 9999 };
+        let dst = Endpoint { addr: ipv4_addr_to_be(std::net::Ipv4Addr::new(127,0,0,1)), port: 45311 };
+        let pkt = build_packet(src, dst, b"raw ip round trip payload", 0x1234);
+        // the header must carry the addresses in wire order
+        assert_eq!(&pkt.bytes[12..16], &[127, 0, 0, 1]);
+        assert_eq!(&pkt.bytes[16..20], &[127, 0, 0, 1]);
+        // ports big-endian
+        assert_eq!(&pkt.bytes[20..22], &9999u16.to_be_bytes());
+        assert_eq!(&pkt.bytes[22..24], &45311u16.to_be_bytes());
+        // and the checksum is the externally specified value
+        assert_eq!(&pkt.bytes[26..28], &[0x18, 0x2f]);
     }
 
     #[test]
