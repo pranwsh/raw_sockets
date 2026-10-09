@@ -11,15 +11,17 @@
 #![forbid(unsafe_code)]
 
 pub use chat_model::{Action, Event};
+pub use link::Transport;
 
 // per-message wire↔model bridge modules; the generated `encode_action` and
 // `decode_event` live in `msgs`
+mod link;
 mod msgs;
+use link::{Closer, LinkReader, LinkWriter};
 use msgs::{decode_event, encode_action};
 
-use protocol::{self, Decode, OwnedFrame};
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use protocol::{self, OwnedFrame};
+use std::io;
 use std::sync::mpsc;
 use std::thread;
 
@@ -29,46 +31,68 @@ use std::thread;
 /// half and parks in the kernel until data arrives, so an idle client costs no
 /// CPU. A second thread drains [`Action`]s and writes them as soon as they are
 /// queued, so outbound latency does not depend on inbound traffic.
-#[derive(Debug)]
 pub struct Client {
     action_tx: mpsc::Sender<Action>,
     event_rx: mpsc::Receiver<Event>,
-    /// a clone kept only so `Drop` can unblock the parked reader
-    closer: Option<TcpStream>,
+    /// kept only so `Drop` can unblock the parked reader
+    closer: Option<Box<dyn Closer>>,
+}
+
+impl std::fmt::Debug for Client {
+    /// deliberately hand-written: the link is a trait object, and `Event` is a
+    /// large enum whose derived output is noisy in a log
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("connected", &self.closer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Client {
-    /// open a connection to the messaging server at `host:port` and spawn the
-    /// background threads that own the socket. Returns once the TCP connection
-    /// is established.
+    /// open a TCP connection to the messaging server at `host:port`
     pub fn connect(host: &str, port: u16) -> io::Result<Client> {
-        let addr = format!("{}:{}", host, port);
-        let stream = TcpStream::connect(&addr)?;
-        // Disable Nagle: message frames are small and lateness-sensitive, and
-        // an unacknowledged in-flight write would otherwise hold up the next
-        // frame for up to ~40ms (delayed-ACK).
-        stream.set_nodelay(true)?;
+        Self::connect_with(Transport::Tcp, host, port)
+    }
 
-        // `try_clone` dups the fd, so both halves refer to the same connection.
-        // Only the reader sets a read timeout: it stays a *blocking* read with a
-        // generous ceiling, so a quiet connection never turns into a busy loop
-        // while a silent peer is still eventually noticed.
-        let reader_stream = stream.try_clone()?;
-        reader_stream.set_read_timeout(Some(READ_PARK_TIMEOUT))?;
+    /// open a connection using `transport`
+    ///
+    /// For [`Transport::RawIp`] the `host` must be a local interface address:
+    /// raw IP is not routed, and the client needs `CAP_NET_RAW` (run as root, or
+    /// grant it with `setcap cap_net_raw+ep`). A raw-IP client also picks its own
+    /// ephemeral source port.
+    pub fn connect_with(transport: Transport, host: &str, port: u16) -> io::Result<Client> {
+        let parts = match link::open(transport, host, port) {
+            Ok(p) => p,
+            Err(e) if transport == Transport::RawIp
+                && e.kind() == io::ErrorKind::PermissionDenied =>
+            {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "raw-ip needs CAP_NET_RAW: {e}. Run as root, or grant it with \
+                         `setcap cap_net_raw+ep` on the binary, or use TCP."
+                    ),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
 
         let (action_tx, action_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let _ = event_tx.send(Event::Connected);
 
-        let closer = stream.try_clone()?;
-        let writer_stream = stream;
-        thread::spawn(move || read_loop(reader_stream, event_tx));
-        thread::spawn(move || write_loop(writer_stream, action_rx));
+        // The reader and writer run on separate threads and share no lock: the
+        // reader parks waiting for inbound data, and a shared mutex would keep it
+        // from ever sending. `closer` lets `Drop` unblock the reader.
+        let mut reader = parts.reader;
+        let mut writer = parts.writer;
+        thread::spawn(move || read_loop(&mut *reader, event_tx));
+        thread::spawn(move || write_loop(&mut *writer, action_rx));
 
         Ok(Client {
             action_tx,
             event_rx,
-            closer: Some(closer),
+            closer: Some(parts.closer),
         })
     }
 
@@ -99,66 +123,36 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        // Shutting down both halves makes the reader's parked `read` return
-        // immediately instead of holding the thread until the peer disconnects.
-        if let Some(s) = self.closer.take() {
-            let _ = s.shutdown(Shutdown::Both);
+        // Closing the link makes the reader's parked read return immediately
+        // instead of holding the thread until the peer disconnects.
+        if let Some(c) = self.closer.take() {
+            c.close();
         }
     }
 }
 
-// how long the reader may park in the kernel before re-checking liveness. This
-// bounds how long a silent server takes to be noticed; it is not a latency
-// path — a healthy connection is woken by the kernel the moment bytes arrive.
-const READ_PARK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 // reader thread — the only place that decodes inbound frames
 
-fn read_loop(mut stream: TcpStream, event_tx: mpsc::Sender<Event>) {
-    // amortised: the buffer grows to the largest frame seen and is then reused
-    let mut buf = Vec::with_capacity(READ_BUF_INIT);
-    let mut scratch = vec![0u8; READ_CHUNK];
-    let mut offset = 0usize;
-
+fn read_loop(reader: &mut dyn LinkReader, event_tx: mpsc::Sender<Event>) {
     loop {
-        // compact first so `buf[offset..]` is the unconsumed tail; `buf` grows
-        // monotonically to the largest frame instead of being drained each round
-        if offset > 0 {
-            buf.copy_within(offset.., 0);
-            buf.truncate(buf.len() - offset);
-            offset = 0;
-        }
-
-        match stream.read(&mut scratch) {
-            Ok(0) => break, // clean EOF — server closed
-            Ok(n) => buf.extend_from_slice(&scratch[..n]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if is_park_timeout(&e) => {
-                // liveness poll; nothing pending on the wire
-                continue;
-            }
-            Err(_) => break,
-        }
-
-        loop {
-            match protocol::decode(&buf[offset..]) {
-                Decode::Complete { frame, consumed } => {
-                    offset += consumed;
-                    let owned = OwnedFrame::from_borrowed(&frame);
+        match reader.read() {
+            Ok(frames) => {
+                if frames.is_empty() {
+                    continue;
+                }
+                for (msg_type, body) in frames {
+                    let owned = OwnedFrame {
+                        version: protocol::VERSION,
+                        flags: 0,
+                        msg_type,
+                        body: body.into_boxed_slice(),
+                    };
                     if event_tx.send(decode_event(owned)).is_err() {
                         return; // receiver dropped; nothing left to do
                     }
                 }
-                Decode::Need => break,
-                // misaligned garbage: skip one byte and resync
-                Decode::Err(_) => offset += 1,
             }
-        }
-
-        if offset == buf.len() {
-            // everything consumed; reset to the empty tail
-            offset = 0;
-            buf.clear();
+            Err(_) => break,
         }
     }
 
@@ -169,7 +163,7 @@ fn read_loop(mut stream: TcpStream, event_tx: mpsc::Sender<Event>) {
 
 // writer thread — parks on the action channel, writes frames as they arrive
 
-fn write_loop(mut stream: TcpStream, action_rx: mpsc::Receiver<Action>) {
+fn write_loop(writer: &mut dyn LinkWriter, action_rx: mpsc::Receiver<Action>) {
     let mut authenticated: Option<Vec<u8>> = None;
     // reused across writes so a steady send loop allocates no frame buffers
     let mut frame: Vec<u8> = Vec::with_capacity(1024);
@@ -185,29 +179,14 @@ fn write_loop(mut stream: TcpStream, action_rx: mpsc::Receiver<Action>) {
         // `seal` writes header+CRC in place, so the body is copied in exactly once
         frame[protocol::HEADER_LEN..protocol::HEADER_LEN + body.len()].copy_from_slice(&body);
         protocol::seal(&mut frame, msg_type, 0, body.len());
-        if stream.write_all(&frame).is_err() {
+
+        if writer.write_frame(&frame).is_err() {
             break;
         }
     }
     // signal a clean end-of-stream so the server sees a prompt close rather
     // than waiting out its own keepalive
-    let _ = stream.shutdown(Shutdown::Write);
-}
-
-// buffer sizing
-
-/// initial read-buffer size; grows to fit the largest frame seen
-const READ_BUF_INIT: usize = 64 * 1024;
-/// kernel read granularity
-const READ_CHUNK: usize = 16 * 1024;
-
-#[inline]
-fn is_park_timeout(e: &io::Error) -> bool {
-    // a blocking socket with SO_RCVTIMEO surfaces both, depending on platform
-    matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
+    writer.close();
 }
 
 // Action → wire frame conversions and wire frame → Event conversions are
@@ -216,6 +195,7 @@ fn is_park_timeout(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::Decode;
     use protocol::MsgType;
     use chat_model::ConvInfo;
 

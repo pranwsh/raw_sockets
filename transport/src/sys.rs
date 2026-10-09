@@ -437,6 +437,31 @@ pub fn getsockname_v4(fd: RawFd) -> io::Result<libc::sockaddr_in> {
     Ok(addr)
 }
 
+/// duplicate a raw socket, returning an independent handle to the same socket
+///
+/// Used when two threads must read from and write to one datagram socket without
+/// sharing a lock: the reader polls while the writer sends, and a shared mutex
+/// would stall whichever side lost the race. The duplicate refers to the same
+/// underlying socket, so filters and options are shared; only the descriptor
+/// number differs.
+pub fn dup_raw_socket(fd: RawFd) -> io::Result<RawFd> {
+    let new = unsafe {
+        // SAFETY: dup(2) returns a new descriptor referring to the same open file
+        // description, or -1 without side effects beyond setting errno. `fd` is a
+        // live socket owned by the caller.
+        libc::dup(fd)
+    };
+    if new < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // match the CLOEXEC convention used when the socket was created
+    unsafe {
+        // SAFETY: fcntl(F_SETFD) on a descriptor this function just created.
+        libc::fcntl(new, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+    Ok(new)
+}
+
 /// set the outgoing interface MTU hint used when choosing fragment size
 pub fn set_mtu_discover(fd: RawFd) -> io::Result<()> {
     let optval: c_int = libc::IP_PMTUDISC_DO;

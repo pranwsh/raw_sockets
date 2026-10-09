@@ -8,3 +8,5 @@ description = "Channel-based client for the messaging service — send Actions, 
 [dependencies]
 protocol = { path = "../protocol" }
 chat-model = { path = "../chat-model" }
+transport = { path = "../transport" }
+libc.workspace = true

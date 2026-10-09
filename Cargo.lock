@@ -815,7 +815,9 @@ name = "msgclient"
 version = "0.1.0"
 dependencies = [
  "chat-model",
+ "libc",
  "protocol",
+ "transport",
 ]
 
 [[package]]
