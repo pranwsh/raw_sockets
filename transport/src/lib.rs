@@ -5,6 +5,7 @@
 pub mod conn;
 pub mod packet;
 pub mod reactor;
+pub mod peer;
 pub mod reliable;
 pub mod sys;
 

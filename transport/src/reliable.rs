@@ -429,6 +429,11 @@ impl ReliabilityLayer {
         ready
     }
 
+    /// the ack state to advertise to the peer
+    pub fn ack_state(&self) -> AckState {
+        self.ack
+    }
+
     /// datagrams buffered for reordering
     pub fn buffered(&self) -> usize {
         self.pending_rx.len()
