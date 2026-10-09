@@ -20,29 +20,29 @@ offloaded to a background thread.
   [PROTOCOL.md](PROTOCOL.md).
 - **Fast transport** (`transport`) — single-threaded edge-triggered epoll
   reactor, per-connection growable buffers (no memmove on partial writes),
-  unified teardown path, and three-stage backpressure.
-- **Account + auth** (`domain`) — single-message handshake with a
-  user-chosen password; new accounts are auto-created on first connect, and
-  reconnects verify the stored salted SHA-256 credential.
-- **Conversations** — deterministic conv IDs derived from the sorted member
-  list; creation; per-conversation sequence numbers.
-- **Store-and-forward inbox** — messages for offline users persist to redb and
-  are delivered on reconnect (at-most-once: read then delete).
+  unified teardown path, three-stage backpressure.
+- **Accounts** (`domain`) — single-message handshake with a user-chosen
+  password; accounts are auto-created on first connect, and reconnects verify
+  the stored salted SHA-256 credential.
+- **Conversations** — deterministic conv IDs from the sorted member list;
+  per-conversation monotonic sequence numbers.
+- **Store-and-forward inbox** — messages for offline users persist to `redb`
+  and are delivered on reconnect (at-most-once).
 - **Online delivery** — messages reach connected members in real time.
 - **Keepalive** — `Ping`/`Pong` for NAT/firewall traversal.
 - **Two binaries** — `msgd` (server) and `msgtui` (the interactive chat TUI).
-- **Benchmarks** (`server/benches/`) — criterion echo-throughput and latency benches.
+- **Benchmarks** (`server/benches/`) — criterion round-trip benches plus a
+  cycle-level breakdown of the send hot path. See [Benchmarks](#benchmarks).
 
 ## Quickstart
 
 Requires a stable Rust toolchain (workspace `edition = "2024"`).
 
-On NixOS the C toolchain comes from the Nix store and is only on `PATH` inside
-an interactive shell, so `.cargo/config.toml` names the gcc wrapper as the
-linker. That keeps `cargo build` working from an IDE task runner, a GUI-launched
-terminal, a container or CI, all of which otherwise fail with
-`error: linker 'cc' not found`. If you are on a different Nix hash, update the
-`linker` path in `.cargo/config.toml`.
+On NixOS the C toolchain lives in the Nix store and is only on `PATH` inside an
+interactive shell, so `.cargo/config.toml` names the gcc wrapper as the linker.
+This keeps `cargo build` working from IDEs, containers and CI, which otherwise
+fail with `error: linker 'cc' not found`. Update that `linker` path if your Nix
+hash differs.
 
 ```sh
 cargo build --release
@@ -103,19 +103,17 @@ Usage: msgtui [--host HOST] [--port PORT] [--user USER] [--password PASSWORD] [-
 | `--conv` | *(none)* | Conversation id (hex) to pre-select. |
 | `--help` / `-h` | — | Show usage and exit. |
 
-Interactive ratatui TUI (see [`msgtui`](#msgtui--the-tui-frontend)). Slash
+Interactive ratatui TUI (see [`msgtui`](#rust-crate-api)). Slash
 commands inside the input box: `/login`, `/logout`, `/create a,b`, `/new`,
 `/list`, `/filter`, `/ping`, `/quit`; typing a plain line sends it into the
-selected conversation.
+selected conversation. Conversations are listed by member name (`alice, bob`)
+rather than opaque ids, with unread badges and a message preview. `Tab` cycles
+focus between the conversation list, transcript and input box; `↑`/`↓` move,
+`Enter` opens, `PageUp`/`PageDown` scroll, `Esc` or `/quit` exits.
 
-Conversations are listed by their member names (`alice, bob`) rather than
-opaque ids, with unread badges and a preview of the latest message. `/filter`
-narrows the list by member, message text, or id. `Tab` cycles focus between the
-conversation list, the transcript and the input box; `↑`/`↓` move, `Enter`
-opens, `PageUp`/`PageDown` scroll the transcript, and `Esc` or `/quit` exits.
-
-`msgtui` is a launcher for the reusable `msgtui` crate: it connects through the
-channel-based `msgclient` client and adapts it to the TUI's `ChatClient` trait.
+The `msgtui` binary is a launcher for the reusable `msgtui` crate: it connects
+through the channel-based `msgclient` and adapts it to the TUI's `ChatClient`
+trait.
 
 
 ## Wire-Protocol API (message types)
@@ -170,105 +168,44 @@ Clients must consume inbound frames promptly.
 
 ## Rust Crate API
 
-Workspace: `protocol`, `transport`, `storage`, `domain`, `server`,
-`client` (msgclient), `tui` (msgtui), `chat-model`. Crate
-boundaries mirror separation of concerns — wire format has no I/O, transport
-has no application logic, domain has no socket knowledge, `msgtui` has no wire
+Workspace crates: `protocol`, `transport`, `storage`, `domain`, `server`,
+`client` (msgclient), `tui` (msgtui), `chat-model`. Boundaries mirror
+separation of concerns — the wire format has no I/O, transport has no
+application logic, domain has no socket knowledge, `msgtui` has no wire
 knowledge.
 
-### `protocol` — wire format
-
-Constants: `MAGIC = 0x4D`, `VERSION = 1`, `HEADER_LEN = 8`,
-`TRAILER_LEN = 4`, `FRAME_OVERHEAD = 12`, `MAX_BODY_LEN = 16 MiB`, flags
-`FLAG_COMPRESSED` / `FLAG_ACK_REQ` (bits 15/14 of the type+flags u16),
-`TYPE_MASK = 0x1FFF`.
-
-- `MsgType` — enum of all message types, generated by the `msg_types!`
-  registry macro from a single `Name = id` table. Provides `from_u16`,
-  `as_u16` and `ALL`; the enum and its numeric mapping can never desync.
-- `Frame<'a>` — decoded frame: `version`, `flags`, `msg_type`, `body`.
-- `OwnedFrame` — owned variant (`from_borrowed(&Frame)`, `to_owned`).
-- `Decode<'a>` — result enum: `Complete { frame, consumed }`, `Need`, `Err`.
-- `decode(&[u8]) -> Decode<'_>` — pure, non-panicking frame decoder.
-- `encode_into` / `encode(msg_type, flags, body) -> Box<[u8]>` — frame encoder.
-- `seal(buf, msg_type, flags, body_len)` — fill header+CRC in a pre-sized
-  buffer (single-allocation delivery, used on the server hot path).
-- `crc32c(&[u8]) -> u32` — Castagnoli checksum over `[ver .. body_end]`.
-- `Payload` — trait for body codecs (`encode` / `decode`). One struct per
-  message body (`HelloReq`, `CreateConvReq`, `SendReq`, `Delivery`,
-  `ConvsRespBody`, `AuthOkBody`, `DeliveredBody`, `Empty`) so each wire
-  format lives in exactly one place.
-- `messages!` (client) and `server_msgs!` (domain) — macros that generate the
-  wire↔model dispatch (`encode_action`/`decode_event`, `on_frame`) from a
-  single per-side inventory list.
-
-### `transport` — I/O reactor
-
-- `EventHandler` (trait) — `on_accept`, `on_frame`, `on_teardown`, `tick`,
-  `drain_outbound`, `drain_teardowns`. The only channel from handler to I/O.
-- `Reactor<H: EventHandler>` — `new(handler, listener_fd, wake_fd)`, `run()`.
-  Single-threaded edge-triggered epoll loop.
-- `ConnectionId(u64)` — per-connection handle.
-- `Connection` — per-connection state: `new`, `do_read`, `try_decode_frame`,
-  `enqueue_frame` → `WriteOutcome` (`Queued` / `Overflow` / `Rejected`),
-  `do_write`, `is_write_empty`, `should_pause_reading`, `start_teardown`,
-  `advance_teardown`, `close_immediately`.
-- `TeardownReason` — `ClientGoodbye`, `ProtocolViolation`, `PeerClosed`,
-  `SlowClient`, `Shutdown`.
-- `sys` — safe wrappers over libc: `set_nonblocking`, `set_reuseport`,
-  `set_reuseaddr`, `set_tcp_nodelay`, `bind_v4`, `listen`, `accept`, `read`,
-  `write`, `shutdown`, `close`, `epoll_create/add/mod/del/wait`,
-  `create_eventfd`/`wake_eventfd`/`drain_eventfd`, `now_ms`.
-
-### `storage` — persistent store
-
-`Store` is `Clone + Send + Sync`; every operation is offloaded to a background
-single-writer thread via `mpsc` and returned on a one-shot channel. The API is
-async (non-blocking, used by the event loop):
-`put_account_async`, `get_account_async`, `put_conversation_async`,
-`get_conversation_async`, `next_sequence_async`, `put_inbox_async`,
-`get_inbox_range_async`, `delete_inbox_async` — each returns a
-`Receiver<StoreResult>`.
-
-- `Store::open(path, notify, durable)`. Results: `StoreResult` enum
-  (`Stored`, `Account`, `Sequence`, `InboxRange`, …) and `StoreError`.
-- Backing tables: accounts (`user_id → credential: salt‖hash`), conversations
-  (`conv_id → member list`), per-conversation sequence counters, and the
-  inbox (`user_id / conv_id / seq → delivery body`).
-
-### `domain` — application logic
-
-- `Domain::new(Store)` — the `EventHandler` implementation wired into the
-  server. Holds sessions, per-user connection sets, user→conversation
-  membership, and in-flight async storage operations.
-- Implements auth (Hello with user-chosen password), conversation create,
-  message send with store-and-forward delivery, conversation listing,
-  `Ping`→`Pong`, and `Presence` echo.
-- Internally derives conversation ids (sorted-member hash) and stores salted
-  SHA-256 password credentials (`salt ‖ sha256(salt ‖ password)`) with the
-  salt read from `/dev/urandom`. A KDF with a work factor (bcrypt/argon2) is
-  recommended for production.
-
-### `msgtui` — the TUI frontend
-
-The [`msgtui`](tui) crate is a reusable, [ratatui](https://ratatui.rs)-based
-chat TUI that drives a generic `ChatClient` trait (`send(Action)`,
-`drain_events(&mut Vec<Event>) -> usize`). The `Action`/`Event` types live in
-the [`chat-model`](chat-model) crate. The `msgtui` binary in `tui/src/bin/`
-wires the TUI to [`msgclient`](#msgclient--the-channel-client) through
-`tui_client.rs` — the adapter that implements `ChatClient` for the channel
-client.
-
-The frontend is split into `state` (model, event folding, input state) and
-`render` (drawing), both unit-tested; the render tests drive ratatui's
-`TestBackend` so layout regressions are caught without a terminal. The `msgtui`
-lib itself has no knowledge of the wire protocol — only the `msgtui` binary ties
-the two together through `tui_client.rs`.
-
-Conversations are keyed by id in a hash map rather than scanned in a vector, so
-an inbound message is O(1) regardless of how many conversations the user
-belongs to. Transcripts are capped per conversation and composer history is
-capped overall, so a long session cannot grow without limit.
+- **`protocol` — wire format.** No dependencies, no I/O, `#![forbid(unsafe_code)]`.
+  `MAGIC = 0x4D`, `VERSION = 1`, 8-byte header, 4-byte CRC32C trailer,
+  `MAX_BODY_LEN = 16 MiB`. `MsgType` is generated from a single `Name = id`
+  registry table (`msg_types!`), so the enum and its numeric mapping can never
+  desync. Decode via `decode(&[u8]) -> Decode<'_>` (`Complete`/`Need`/`Err`,
+  non-panicking); encode via `encode` / `encode_into`, or `seal()` to fill
+  header+CRC in a pre-sized buffer in a single allocation (the server hot
+  path). Each message body is one `Payload` struct, so each wire format lives
+  in exactly one place.
+- **`transport` — I/O reactor.** `EventHandler` is the only channel from
+  handler to I/O (`on_accept`, `on_frame`, `on_teardown`, `tick`,
+  `drain_outbound`, `drain_teardowns`). `Reactor<H>` is a single-threaded,
+  edge-triggered epoll loop. `Connection` owns per-connection buffers with
+  three-stage backpressure; `sys` wraps the libc/epoll calls.
+- **`storage` — persistent store.** `Store` is `Clone + Send + Sync`; every
+  operation is offloaded to a single background writer thread over `mpsc` and
+  returns a `Receiver<StoreResult>` immediately, so the reactor never blocks.
+  Tables: accounts, conversations, per-conversation sequence counters, inbox.
+- **`domain` — application logic.** The `EventHandler` implementation: auth,
+  conversation create, message send with store-and-forward delivery,
+  conversation listing, `Ping`/`Pong`, `Presence`. Derives conversation ids
+  from the sorted member list and stores salted SHA-256 credentials
+  (`salt ‖ sha256(salt ‖ password)`) with the salt from `/dev/urandom` — a KDF
+  with a work factor (bcrypt/argon2) is recommended for production.
+- **`msgtui` — the TUI frontend.** A reusable ratatui chat frontend driving a
+  generic `ChatClient` trait; `Action`/`Event` live in `chat-model`. Split into
+  `state` (model, event folding, input) and `render` (drawing), both
+  unit-tested — render tests use ratatui's `TestBackend`, so layout
+  regressions are caught without a terminal. Conversations are keyed by id in
+  a hash map, making inbound lookup O(1) regardless of how many
+  conversations the user belongs to; transcripts and composer history are
+  capped so a long session cannot grow without limit.
 
 ## Configuration & Operation
 
@@ -279,60 +216,149 @@ capped overall, so a long session cannot grow without limit.
 
 ## Adding a message type
 
-The plumbing for each new message is centralized in single registries, so an
-addition is a small, mechanical diff across a handful of sites — and the
-generated-style dispatch fails loudly if a row is forgotten.
+The plumbing for each message is centralized in single registries, so an
+addition is a mechanical diff across a few sites. Using `ReadReceipt` as an
+example:
 
-Work through this checklist for a new wire message (`ReadReceipt` as an
-example):
+| # | File | Change |
+|---|---|---|
+| 1 | `protocol/src/lib.rs` | Register the wire id in the `msg_types!` table (`ReadReceipt = 25,`). The enum, `from_u16`/`as_u16` and `ALL` are all generated from it. |
+| 2 | `protocol/src/lib.rs` | Define the body once as a `Payload` struct implementing `encode`/`decode`. Empty or opaque bodies reuse `Empty`/`Opaque`. |
+| 3 | `chat-model/src/lib.rs` | Add `Action::ReadReceipt` (C→S) and/or `Event::ReadReceipt` (S→C). The model stays wire-free. |
+| 4 | `client/src/msgs/` | Add a bridge module (`TYPE` + `decode` → `Event`, `encode(Action)`), then add its name to the matching `messages!` list in `mod.rs`, which generates `encode_action`/`decode_event`. |
+| 5 | `domain/src/lib.rs` | Add a handler method that decodes the inbound `Payload` and updates state, then add a `MsgType => handler` row to `server_msgs!` (generates `on_frame`). Handlers with an async store hop also get a `PendingKind` arm. |
+| 6 | `tui/src/lib.rs` | Handle the new `Event` in `apply_event` if it is user-visible. |
+| 7 | `PROTOCOL.md` + this README | Add a row to the message table describing the body layout. |
+| 8 | `protocol/src/tests.rs` | Add a `Payload` round-trip case. The registry/duplicate-id tests run automatically against `MsgType::ALL`. |
 
-1. **`protocol/src/lib.rs`** — register the wire id in the `msg_types!` table,
-   e.g. `ReadReceipt = 25,`. The enum, `from_u16`/`as_u16` and `ALL` are all
-   generated from it.
+Steps 4–5 are the ones that can silently do nothing if you forget a row, so
+the type checks there plus the step-8 tests are what guarantee completeness.
 
-2. **`protocol/src/lib.rs`** — define the body layout once as a `Payload`
-   struct if the body is structured (e.g. `ReadReceipt { conv, seq }`),
-   implementing `encode`/`decode`. Empty/opaque bodies reuse `Empty`/`Opaque`.
-
-3. **`chat-model/src/lib.rs`** — add the model variant: `Action::ReadReceipt`
-   for client→server, `Event::ReadReceipt` for server→client. The model stays
-   wire-free.
-
-4. **`client/src/msgs/`** — add a bridge module (`TYPE` + `decode` → `Event`
-   for server→client; `encode(Action)` for client→server), then add its name
-   to the matching `messages!` list in `client/src/msgs/mod.rs`. That list
-   generates `encode_action`/`decode_event`.
-
-5. **`domain/src/lib.rs`** — add a handler method that decodes the inbound
-   `Payload` and updates state, then add a `MsgType => handler` row to the
-   `server_msgs!` list (generates `on_frame`). Handlers that involve async
-   store hops also get a `PendingKind` arm as before.
-
-6. **`tui/src/lib.rs`** — handle the new `Event` in `apply_event` if it is
-   user-visible (e.g. show a read receipt in the status line).
-
-7. **Docs** — add a row to the message table in `PROTOCOL.md` (and this README’s
-   table above) describing the body layout.
-
-8. **Wire-format tests** — add a `Payload` round-trip case in
-   `protocol/src/tests.rs`; the registry/duplicate-id tests in that file run
-   automatically against `MsgType::ALL`.
-
-The registry macros (`msg_types!`, `messages!`, `server_msgs!`) are the only
-places where a missing entry silently breaks nothing — so the tests in step 8
-and the compile-time type checks in steps 4–5 are what guarantee completeness.
-
-## Tests & Benchmarks
+## Tests
 
 ```sh
-cargo test          # protocol unit tests + server integration tests + client tests
-cargo bench         # criterion echo-throughput / latency benches (benches/echo.rs)
+cargo test
 ```
 
 Integration tests (`server/tests/integration.rs`) spin up the real server over
 real sockets and cover auth (new + reconnect), conversation create + send, and
 ping/pong. Client tests (`client/tests/`) exercise the `msgclient` channel API
 against a live server (connect, idle, latency).
+
+## Benchmarks
+
+```sh
+cargo build --release                             # the wire bench spawns target/release/msgd
+cargo bench -p server --bench echo                # criterion round-trips
+cargo bench -p server --bench send_cycles         # cycle-level breakdown of the send path
+
+# storage numbers are only meaningful on real disk — /tmp is tmpfs on many
+# systems, which makes fsync look free:
+MSGD_BENCH_DATA_DIR=/var/tmp cargo bench -p server --bench send_cycles
+```
+
+### Methodology
+
+No single harness can measure the whole send path, so `send_cycles` has three
+parts: pure-CPU stages in TSC cycles, the storage hop in isolation, and full
+end-to-end over loopback TCP. The TSC is calibrated against `Instant` at
+startup, because the TSC is not the core clock and raw counts are otherwise
+meaningless.
+
+Three things that will silently corrupt these numbers if you skip them:
+
+1. **`_rdtsc` is not a compiler barrier.** LLVM models it as may-read-memory,
+   so pure work gets hoisted across it and the measured region measures
+   nothing. Every region is fenced with an `asm!` barrier and its result forced
+   to memory.
+2. **Single-shot `rdtsc` pairs cost ~60 cycles of overhead** on the reference
+   host, so anything "instant" below that is measuring the timer. Sub-100-cycle
+   work is timed in batches: N operations inside one TSC pair, divided.
+3. **Batched loops must vary their input.** With a constant input LLVM hoists
+   the whole computation out of the inner loop and reports a fantasy ~1.36
+   cyc/op. Every measured closure takes a counter and perturbs its buffer with
+   it.
+
+One more trap worth stating: **`/tmp` is frequently tmpfs.** There, `fsync` costs
+almost nothing and `--fast` and `--durable` measure identically. On the
+reference host that difference was 18 µs on tmpfs versus 333 µs vs 439 µs on
+ext4 — a ~20× swing from the filesystem alone.
+
+### Results
+
+Reference host: AMD Ryzen 7 5825U (Zen 3, 8c/16t), TSC 1.9963 GHz
+(1 cycle = 0.5009 ns). Treat absolute disk figures as machine-specific; the
+pure-CPU cycle counts and the send-vs-ping ratio are the portable parts.
+
+Pure CPU, 12-byte body / 24-byte frame:
+
+| Stage | cycles/op |
+|---|---|
+| Header write only, stack buffer (no CRC) | 1.7 |
+| `seal_shared` without CRC (alloc + copy + header) | 34 |
+| `SendReq::decode` (inbound parse) | 43 |
+| `Delivery::encode` | 70 |
+| **`seal_shared` — Arc alloc + copy + table CRC** | **79** |
+| header + `crc32c` 19 B, table | 36 |
+| header + `crc32c` 19 B, SSE4.2 | 15 |
+
+`crc32c` is byte-at-a-time table lookup; this CPU has a hardware CRC32C
+instruction, which is bit-identical (verified: `0x9c44184b` both ways on a
+256-byte ramp):
+
+| bytes | table | SSE4.2 | speedup |
+|---|---|---|---|
+| 64 | 189 | 22 | 8.4× |
+| 256 | 885 | 58 | 15.4× |
+| 1024 | 3,592 | 184 | 19.5× |
+| 4096 | 14,499 | 690 | 21.0× |
+| 16384 | 57,836 | 2,714 | 21.3× |
+
+Storage hop and end-to-end, on ext4 (`MSGD_BENCH_DATA_DIR` on real storage):
+
+| Component | p50 | cycles |
+|---|---|---|
+| storage hop, `--fast` (`Eventual`) | 333 µs | ~666,000 |
+| storage hop, `--durable` (fsync) | 439 µs | ~877,000 |
+| `enqueue` onto the mpsc (synchronous part) | 0.11 µs | ~220 |
+| `Ping` round trip (control, same connection) | 17.0 µs | ~34,000 |
+| `Send` round trip, end-to-end | 39.5 µs | ~79,000 |
+| **`Send` − `Ping`** | **26.6 µs** | **~53,000** |
+
+On tmpfs the same code measures 18 µs for the storage hop and ~39 µs end-to-end.
+
+### What the numbers say
+
+A send is **~79,000 cycles end-to-end but only ~79 cycles of CPU** — about 99.9%
+of it is I/O wait. The cost is dominated by opening and committing a `redb`
+write transaction for the per-message sequence number; `fsync` adds ~26% on top
+of that. Optimising the CRC (a ~20× win on the checksum itself) would move the
+end-to-end time by far less than a rounding error.
+
+In priority order:
+
+1. **Block-allocate sequence numbers** — allocate N per write transaction
+   instead of one per message. This is the only change that matters by orders
+   of magnitude, and it also shrinks how often `--durable` pays for `fsync`.
+2. **Batch writes per `write()` syscall** if you ever chase throughput — one
+   syscall is ~9,700 cycles on this host.
+3. **Hardware CRC** — cheap to adopt and a real win at 4 KB+ payloads, but it
+   needs an `unsafe` island (`protocol` is `#![forbid(unsafe_code)]`) and is
+   worth ~20 cycles per small message, which is noise against a 39 µs send.
+
+Note that Zen 3's CRC32 (3-cycle latency, ~0.5/cycle throughput) is favourable:
+the table-driven penalty is *smaller* here than on older Intel, and much smaller
+than on ARM without a CRC extension. Re-run before committing to hardware CRC.
+
+### A bug this benchmarking found
+
+`server/benches/echo.rs` used `frame.body.to_vec()` as the conversation id, but
+a `ConvCreated` body is `<8-byte id><members>\n`. The server rejected the
+bogus id with `conv_not_found`, and the bench then blocked on a read waiting
+for a `Delivered` that never came — `cargo bench -p server --bench echo` failed
+outright with a `WouldBlock` panic rather than reporting a number. Fixed to take
+`frame.body[..8]`. If you write a new client, `ConvCreated` and `ConvsResp` are
+the two places that carry a length-less record you have to know the layout of.
 
 ## Layout
 

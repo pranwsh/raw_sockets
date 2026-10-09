@@ -164,7 +164,12 @@ fn send_round_trip(addr: SocketAddr) -> Duration {
         match protocol::decode(&buf[..offset]) {
             Decode::Complete { frame, consumed } => {
                 if frame.msg_type == MsgType::ConvCreated {
-                    conv_id = frame.body.to_vec();
+                    // ConvCreated body is `<8-byte conv_id><members>\n`; the id
+                    // is only the FIRST 8 BYTES. Taking the whole body sends a
+                    // bogus id, the server replies `conv_not_found`, and the loop
+                    // below then blocks forever waiting for a `Delivered` frame
+                    // that never arrives (manifests as a WouldBlock read panic).
+                    conv_id = frame.body[..8].to_vec();
                     offset -= consumed;
                     buf.copy_within(consumed.., 0);
                     break;

@@ -23,3 +23,8 @@ criterion.workspace = true
 name = "echo"
 harness = false
 path = "benches/echo.rs"
+
+[[bench]]
+name = "send_cycles"
+harness = false
+path = "benches/send_cycles.rs"
