@@ -6,6 +6,9 @@ use libc::{c_int, c_void, size_t};
 use std::io;
 use std::os::unix::io::RawFd;
 
+/// a socket address as the kernel represents it
+pub type SockAddr = libc::sockaddr_in;
+
 // non-blocking fd management
 
 /// set O_NONBLOCK on fd returns io::Error on failure (e.g bad fd)
@@ -265,19 +268,25 @@ pub fn epoll_wait(epfd: RawFd, events: &mut [libc::epoll_event], timeout_ms: c_i
 // kernel a complete packet via `IP_HDRINCL`. That requires `CAP_NET_RAW`, so
 // every function here can fail with EPERM on a host without the capability.
 
-/// create a raw IPv4 socket for datagrams (`SOCK_RAW` + `IPPROTO_RAW`)
+/// create a raw IPv4 socket carrying UDP (`SOCK_RAW` + `IPPROTO_UDP`)
 ///
-/// With `IPPROTO_RAW` the protocol is taken from each packet's IP header, so one
-/// socket can carry every protocol. Requires `CAP_NET_RAW`.
+/// The protocol argument must be `IPPROTO_UDP`, **not** `IPPROTO_RAW`.
+/// `IPPROTO_RAW` means "receive everything", but Linux filters the receive queue
+/// so that only protocols which are not handled by another kernel subsystem are
+/// delivered — in practice a socket created with `IPPROTO_RAW` never sees
+/// ordinary UDP datagram input at all. Sending works either way, which makes the
+/// asymmetry easy to miss: `sendto` succeeds and the peer never replies.
+///
+/// Requires `CAP_NET_RAW`.
 pub fn socket_raw_ipv4() -> io::Result<RawFd> {
     let fd = unsafe {
-        // SAFETY: socket() allocates a descriptor and returns it; IPPROTO_RAW
-        // defers the protocol to the per-packet IP header, so the kernel does
-        // not filter by protocol here.
+        // SAFETY: socket() allocates a descriptor and returns it. IPPROTO_UDP
+        // tells the kernel to deliver received UDP datagrams to this socket;
+        // with IP_HDRINCL set we still supply the IP header ourselves.
         libc::socket(
             libc::AF_INET,
             libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-            libc::IPPROTO_RAW,
+            libc::IPPROTO_UDP,
         )
     };
     if fd < 0 {
@@ -404,6 +413,28 @@ pub fn recv_packet(fd: RawFd, buf: &mut [u8], from: &mut libc::sockaddr_in) -> i
         }
         return Ok(rc as usize);
     }
+}
+
+/// maximum events returned by one `epoll_wait` call
+pub const EPOLL_MAX_EVENTS: usize = 64;
+
+/// read the address a socket is bound to
+pub fn getsockname_v4(fd: RawFd) -> io::Result<libc::sockaddr_in> {
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&addr) as libc::socklen_t;
+    let rc = unsafe {
+        // SAFETY: getsockname writes at most `len` bytes into `addr`, whose size
+        // we pass in.
+        libc::getsockname(
+            fd,
+            &mut addr as *mut _ as *mut libc::sockaddr,
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(addr)
 }
 
 /// set the outgoing interface MTU hint used when choosing fragment size

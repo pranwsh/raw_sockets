@@ -221,6 +221,13 @@ impl Peer {
         next
     }
 
+    /// put a datagram back at the head of the queue after a transient send
+    /// failure, so the next tick retries it ahead of newer traffic
+    pub fn requeue_front(&mut self, bytes: Vec<u8>) {
+        self.send_queue.push_front(bytes);
+        self.write_pending = true;
+    }
+
     /// datagrams waiting to be transmitted
     pub fn send_queue_len(&self) -> usize {
         self.send_queue.len()
@@ -306,6 +313,16 @@ impl Peer {
             None => false,
             Some(t) => self.is_write_empty() || now_ms >= t.deadline_ms,
         }
+    }
+
+    /// payloads received but not yet released in order
+    pub fn buffered(&self) -> usize {
+        self.reliable.buffered()
+    }
+
+    /// datagrams sent but not yet acknowledged
+    pub fn unacked(&self) -> usize {
+        self.reliable.unacked()
     }
 
     pub fn stats(&self) -> PeerStats {
