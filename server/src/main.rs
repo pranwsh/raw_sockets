@@ -2,20 +2,47 @@
 
 use domain::Domain;
 use storage::{Durability, Store};
+use transport::dgram::DgramReactor;
 use transport::Reactor;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
+/// which network transport the server speaks
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// TCP stream sockets: the default, and the only option that reaches
+    /// another host
+    Tcp,
+    /// raw IP/UDP datagrams: needs `CAP_NET_RAW`, and is local-interface only
+    RawIp,
+}
+
+impl Transport {
+    fn parse(s: &str) -> Result<Transport, String> {
+        match s {
+            "tcp" => Ok(Transport::Tcp),
+            "raw-ip" | "udp" => Ok(Transport::RawIp),
+            other => Err(format!("unknown transport {other:?} (expected tcp or raw-ip)")),
+        }
+    }
+}
+
 struct Config {
     bind: String,
     data_path: String,
     durable: bool,
+    transport: Transport,
 }
 
 fn parse_config() -> Config {
     let args: Vec<String> = std::env::args().collect();
-    let mut c = Config { bind: "0.0.0.0:9723".into(), data_path: "/tmp/msgd.redb".into(), durable: false };
+    let mut c = Config {
+        bind: "0.0.0.0:9723".into(),
+        data_path: "/tmp/msgd.redb".into(),
+        durable: false,
+        transport: Transport::Tcp,
+    };
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -25,8 +52,15 @@ fn parse_config() -> Config {
             // default fast mode skips the fsync on the message path
             "--durable" => { c.durable = true; i += 1; }
             "--fast" => { c.durable = false; i += 1; }
+            "--transport" if i + 1 < args.len() => {
+                match Transport::parse(&args[i + 1]) {
+                    Ok(t) => c.transport = t,
+                    Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+                }
+                i += 2;
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: msgd [--bind ADDR] [--data PATH] [--fast|--durable]");
+                eprintln!("Usage: msgd [--bind ADDR] [--data PATH] [--fast|--durable] [--transport tcp|raw-ip]");
                 std::process::exit(0);
             }
             _ => { eprintln!("Unknown: {}", args[i]); std::process::exit(1); }
@@ -93,6 +127,20 @@ fn main() {
         }
     };
 
+    let durability_label = if config.durable { "durable" } else { "fast" };
+    let domain = Domain::new(store);
+
+    // The two transports differ only in their reactor: `Domain` is the
+    // EventHandler for both, so all the application logic, storage and framing
+    // are shared unchanged.
+    match config.transport {
+        Transport::Tcp => run_tcp(config, domain, wake_fd, durability_label),
+        Transport::RawIp => run_raw_ip(config, domain, wake_fd, durability_label),
+    }
+}
+
+/// serve over TCP stream sockets
+fn run_tcp(config: Config, domain: Domain, wake_fd: RawFd, durability_label: &str) -> ! {
     let (listener_fd, addr) = match create_listener(&config.bind) {
         Ok(v) => v,
         Err(e) => {
@@ -100,9 +148,10 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("msgd listening on {} (data: {}, durability: {})", addr, config.data_path, if config.durable { "durable" } else { "fast" });
-
-    let domain = Domain::new(store);
+    eprintln!(
+        "msgd listening on {} (transport: tcp, data: {}, durability: {})",
+        addr, config.data_path, durability_label
+    );
 
     let mut reactor: Reactor<Domain> = match Reactor::new(domain, Some(listener_fd), Some(wake_fd)) {
         Ok(r) => r,
@@ -117,4 +166,57 @@ fn main() {
         eprintln!("msgd error: {}", e);
     }
     eprintln!("msgd shut down.");
+    std::process::exit(0);
+}
+
+/// serve over raw IP/UDP datagrams
+fn run_raw_ip(config: Config, domain: Domain, wake_fd: RawFd, durability_label: &str) -> ! {
+    // Reuse the same `host:port` syntax as `--bind` so the two transports are
+    // configured identically.
+    let addr: SocketAddr = match config.bind.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Invalid --bind address {:?}: {e}", config.bind);
+            std::process::exit(1);
+        }
+    };
+    let SocketAddr::V4(a4) = addr else {
+        eprintln!("raw-ip supports IPv4 only");
+        std::process::exit(1);
+    };
+
+    let local = transport::packet::Endpoint {
+        // network byte order, matching `sockaddr_in::sin_addr`
+        addr: u32::from_be_bytes(a4.ip().octets()),
+        port: a4.port(),
+    };
+
+    let mut reactor: DgramReactor<Domain> =
+        match DgramReactor::new(domain, local, Some(wake_fd)) {
+            Ok(r) => r,
+            Err(e) => {
+                // EPERM here is the common case: raw sockets need CAP_NET_RAW,
+                // which an unprivileged container will not have.
+                eprintln!("Failed to create raw IP socket: {e}");
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    eprintln!("raw-ip needs CAP_NET_RAW — run as root, or:");
+                    eprintln!("  setcap cap_net_raw+ep {}", std::env::current_exe().unwrap_or_default().display());
+                    eprintln!("or use --transport tcp, which needs no privileges.");
+                }
+                std::process::exit(1);
+            }
+        };
+
+    eprintln!(
+        "msgd listening on {} (transport: raw-ip, data: {}, durability: {})",
+        addr, config.data_path, durability_label
+    );
+    eprintln!("note: raw-ip is local-interface only, and does not reassemble");
+    eprintln!("      fragments on loopback, so payloads must fit one datagram there.");
+    eprintln!("msgd ready.");
+    if let Err(e) = reactor.run() {
+        eprintln!("msgd error: {}", e);
+    }
+    eprintln!("msgd shut down.");
+    std::process::exit(0);
 }
