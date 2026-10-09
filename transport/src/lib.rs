@@ -5,6 +5,7 @@
 pub mod conn;
 pub mod packet;
 pub mod reactor;
+pub mod reliable;
 pub mod sys;
 
 pub use conn::{ConnectionId, TeardownReason};
