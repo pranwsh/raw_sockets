@@ -1,4 +1,3 @@
-# msgd — Raw-Socket Messaging Service
 
 A high-performance, dependency-light messaging server and client written in Rust.
 
